@@ -1,0 +1,5 @@
+target/
+state/
+config.json
+*.log
+test.sh

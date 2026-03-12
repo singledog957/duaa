@@ -1,0 +1,20 @@
+[package]
+name = "duaa"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "duaa"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+rand = "0.9"
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+dashmap = "6"

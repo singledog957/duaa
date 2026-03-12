@@ -1,0 +1,22 @@
+{
+    "poll_interval_minutes": 10,
+    "auto_window_minutes": 15,
+    "log_file": "backend_pub.log",
+    "students": [
+        {
+            "student_id": "your_student_id_1",
+            "name": "User One",
+            "course_ids": [
+                "your_course_id_a",
+                "your_course_id_b"
+            ]
+        },
+        {
+            "student_id": "your_student_id_2",
+            "name": "User Two",
+            "course_ids": [
+                "your_course_id_c"
+            ]
+        }
+    ]
+}
