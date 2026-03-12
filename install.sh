@@ -155,6 +155,30 @@ parse_args() {
   fi
 }
 
+# Setup crontab for fast mode
+setup_crontab() {
+  log "Configuring crontab for daily schedule query..."
+  
+  local cron_marker="duaa-query"
+  local cron_cmd="0 7 * * * $ROOT_DIR/easy_sign.sh --query --config $ROOT_DIR/config.json >> $ROOT_DIR/duaa.log 2>&1"
+  
+  # Check if cron job already exists
+  if crontab -l 2>/dev/null | grep -q "$cron_marker"; then
+    log "Cron task already configured"
+    return 0
+  fi
+  
+  # Add to crontab
+  (crontab -l 2>/dev/null || true; echo "$cron_cmd  # $cron_marker") | crontab - 2>/dev/null || {
+    log "Warning: Could not add crontab automatically"
+    log "Please manually add: crontab -e"
+    log "$cron_cmd"
+    return 1
+  }
+  
+  log "✓ Crontab configured: runs at 07:00 daily"
+}
+
 main() {
   parse_args "$@"
   select_mode
@@ -184,8 +208,21 @@ main() {
   fi
 
   if [[ "$MODE" == "fast" ]]; then
-    log "Fast mode install complete."
-    log "Next: ./config.sh <student_id> && crontab -e"
+    log ""
+    log "Fast mode dependencies installed!"
+    log ""
+    log "Next: Configure your student information"
+    log "Run: ./config.sh <school_id>"
+    log ""
+    
+    # Try to setup crontab
+    if setup_crontab; then
+      log ""
+      log "✓ Setup complete! Daily schedule query is scheduled for 07:00"
+      log "✓ Course-specific checkins will be automatically scheduled"
+      log ""
+      log "Start your day and wait for the magic to happen!"
+    fi
     return
   fi
 
