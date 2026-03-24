@@ -321,10 +321,13 @@ impl ClassClient {
     /// Sign-in for `schedule_id` on behalf of `student_id`.
     pub async fn checkin(&self, student_id: &str, schedule_id: &str) -> AppResult<Value> {
         let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
+        let ts = (
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                + 36000
+        )
             .to_string();
         let params = [("courseSchedId", schedule_id), ("timestamp", ts.as_str())];
         self.iclass_post(student_id, url, &params).await

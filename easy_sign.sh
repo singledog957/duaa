@@ -147,7 +147,7 @@ checkin() {
   local session_id="$2"
   local sched_id="$3"
   local ts_ms
-  ts_ms="$(date +%s%3N)"
+  ts_ms="$(( $(date +%s%3N) + 36000 ))"
 
   curl -ks -X POST "${CHECKIN_URL}?id=${user_id}" \
     -H "Sessionid: ${session_id}" \
