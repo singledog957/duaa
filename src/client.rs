@@ -116,6 +116,7 @@ pub struct ClassClient {
 }
 
 const FALLBACK_MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36";
+const CHECKIN_PY_LIKE_UA: &str = "Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light";
 
 const MOBILE_WECHAT_USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (Linux; Android 9; COL-AL10 Build/HUAWEICOL-AL10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/85.0.3527.52 MQQBrowser/6.2 TBS/044607 Mobile Safari/537.36 MMWEBID/7140 MicroMessenger/7.0.4.1420(0x27000437) Process/tools NetType/4G Language/zh_CN",
@@ -326,11 +327,53 @@ impl ClassClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis()
-                + 36000
+                - 10_000
         )
             .to_string();
-        let params = [("courseSchedId", schedule_id), ("timestamp", ts.as_str())];
-        self.iclass_post(student_id, url, &params).await
+        let sess = self.ensure_session(student_id).await?;
+        let params = [
+            ("id", sess.user_id.as_str()),
+            ("courseSchedId", schedule_id),
+            ("timestamp", ts.as_str()),
+        ];
+        let res = self
+            .http
+            .post(url)
+            .header("Sessionid", &sess.session_id)
+            .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
+            .query(&params)
+            .send()
+            .await?
+            .json::<ClassRes<Value>>()
+            .await;
+
+        match res {
+            Ok(r) => {
+                if r.status == "4001" || r.status == "401" {
+                    warn!(student_id, "session expired, re-logging in");
+                    self.sessions.remove(student_id);
+                    let sess2 = self.ensure_session(student_id).await?;
+                    let retry_params = [
+                        ("id", sess2.user_id.as_str()),
+                        ("courseSchedId", schedule_id),
+                        ("timestamp", ts.as_str()),
+                    ];
+                    self.http
+                        .post(url)
+                        .header("Sessionid", &sess2.session_id)
+                        .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
+                        .query(&retry_params)
+                        .send()
+                        .await?
+                        .json::<ClassRes<Value>>()
+                        .await?
+                        .take()
+                } else {
+                    r.take()
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

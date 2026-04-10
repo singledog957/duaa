@@ -25,7 +25,7 @@ LOGIN_URL="https://iclass.buaa.edu.cn:8347/app/user/login.action"
 SCHEDULE_URL="https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action"
 CHECKIN_URL="http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action"
 
-UA="Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36"
+UA="Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light"
 
 log() {
   printf "[%s] %s\n" "$(date '+%F %T')" "$*"
@@ -147,12 +147,13 @@ checkin() {
   local session_id="$2"
   local sched_id="$3"
   local ts_ms
-  ts_ms="$(( $(date +%s%3N) + 36000 ))"
+  ts_ms="$(( $(date +%s%3N) - 10000 ))"
 
-  curl -ks -X POST "${CHECKIN_URL}?id=${user_id}" \
+  curl -ks -X POST "${CHECKIN_URL}" \
     -H "Sessionid: ${session_id}" \
     -H "User-Agent: $UA" \
     --get \
+    --data-urlencode "id=${user_id}" \
     --data-urlencode "courseSchedId=${sched_id}" \
     --data-urlencode "timestamp=${ts_ms}"
 }
