@@ -108,11 +108,16 @@ impl CourseSchedule {
 // ── ClassClient ───────────────────────────────────────────────────────────────
 
 const SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const CHECKIN_OFFSET_MIN: i64 = -15_000;
+const CHECKIN_OFFSET_MAX: i64 = -1_000;
 
 pub struct ClassClient {
     http: Client,
     sessions: DashMap<String, Session>,
     schedule_cache: DashMap<(String, String), (Instant, Vec<Schedule>)>,
+    /// Cache the last valid checkin offset for each student.
+    /// Stores (offset, last_update_time) for each student.
+    checkin_offset_cache: DashMap<String, (i64, Instant)>,
 }
 
 const FALLBACK_MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36";
@@ -172,6 +177,7 @@ impl ClassClient {
             http,
             sessions: DashMap::new(),
             schedule_cache: DashMap::new(),
+            checkin_offset_cache: DashMap::new(),
         }
     }
 
@@ -321,13 +327,101 @@ impl ClassClient {
 
     /// Sign-in for `schedule_id` on behalf of `student_id`.
     pub async fn checkin(&self, student_id: &str, schedule_id: &str) -> AppResult<Value> {
+        // Try the cached offset first (if available and recent)
+        if let Some(entry) = self.checkin_offset_cache.get(student_id) {
+            let (offset, _) = *entry;
+            match self.do_checkin(student_id, schedule_id, offset).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    // Check if this is an offset-related error
+                    if self.is_offset_error(&err) {
+                        debug!(student = student_id, "cached offset invalid, starting binary search");
+                        // Fall through to binary search
+                    } else {
+                        // Other errors should not trigger offset search
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // Binary search for a valid offset
+        info!(student = student_id, "binary searching for valid checkin offset");
+        let new_offset = self.binary_search_offset(student_id, schedule_id).await?;
+        info!(student = student_id, offset = new_offset, "found valid offset");
+        
+        // Cache the found offset
+        self.checkin_offset_cache.insert(student_id.to_owned(), (new_offset, Instant::now()));
+        
+        // Perform the actual checkin with the found offset
+        self.do_checkin(student_id, schedule_id, new_offset).await
+    }
+
+    /// Check if an error message suggests offset-related issues.
+    fn is_offset_error(&self, err: &AppError) -> bool {
+        let msg = &err.message;
+        msg.contains("参数错误") || msg.contains("二维码已失效") || msg.contains("已失效")
+    }
+
+    /// Binary search for a valid offset in the range [CHECKIN_OFFSET_MIN, CHECKIN_OFFSET_MAX].
+    async fn binary_search_offset(&self, student_id: &str, schedule_id: &str) -> AppResult<i64> {
+        let mut lo = CHECKIN_OFFSET_MIN;
+        let mut lo_err = "参数错误".to_string(); // Assume we start with too-small offset
+        let mut hi = CHECKIN_OFFSET_MAX;
+        let mut hi_err = "二维码已失效".to_string(); // Assume we end with too-large offset
+
+        while lo < hi - 1 {
+            let mid = (lo + hi) / 2;
+            match self.do_checkin(student_id, schedule_id, mid).await {
+                Ok(_) => {
+                    // Found a valid offset, but continue searching to find the boundary
+                    // (in case there's a specific valid range).
+                    // For simplicity, we'll accept the first valid one found.
+                    return Ok(mid);
+                }
+                Err(err) => {
+                    let msg = err.message.as_str();
+                    if msg.contains("参数错误") {
+                        // Offset is too small, search in the upper half
+                        lo = mid;
+                        lo_err = msg.to_string();
+                    } else if msg.contains("二维码已失效") || msg.contains("已失效") {
+                        // Offset is too large, search in the lower half
+                        hi = mid;
+                        hi_err = msg.to_string();
+                    } else {
+                        // Some other error, not offset-related
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // If we've exhausted the search, try the remaining candidates
+        for offset in [lo, lo + 1, hi - 1, hi].iter().copied() {
+            if offset < CHECKIN_OFFSET_MIN || offset > CHECKIN_OFFSET_MAX {
+                continue;
+            }
+            if let Ok(_) = self.do_checkin(student_id, schedule_id, offset).await {
+                return Ok(offset);
+            }
+        }
+
+        Err(AppError::remote(format!(
+            "binary search failed: lo={} ({}), hi={} ({})",
+            lo, lo_err, hi, hi_err
+        )))
+    }
+
+    /// Perform a single checkin request with the given offset.
+    async fn do_checkin(&self, student_id: &str, schedule_id: &str, offset: i64) -> AppResult<Value> {
         let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
         let ts = (
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis()
-                - 10_000
+                .as_millis() as i64
+                + offset
         )
             .to_string();
         let sess = self.ensure_session(student_id).await?;
@@ -347,7 +441,7 @@ impl ClassClient {
             .json::<ClassRes<Value>>()
             .await;
 
-        match res {
+        let result = match res {
             Ok(r) => {
                 if r.status == "4001" || r.status == "401" {
                     warn!(student_id, "session expired, re-logging in");
@@ -367,13 +461,15 @@ impl ClassClient {
                         .await?
                         .json::<ClassRes<Value>>()
                         .await?
-                        .take()
+                        .take()?
                 } else {
-                    r.take()
+                    r.take()?
                 }
             }
-            Err(e) => Err(e.into()),
-        }
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(result)
     }
 }
 
