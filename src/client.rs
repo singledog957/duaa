@@ -110,13 +110,14 @@ impl CourseSchedule {
 const SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const CHECKIN_OFFSET_MIN: i64 = -15_000;
 const CHECKIN_OFFSET_MAX: i64 = -1_000;
+const GLOBAL_CHECKIN_OFFSET_CACHE_KEY: &str = "global";
 
 pub struct ClassClient {
     http: Client,
     sessions: DashMap<String, Session>,
     schedule_cache: DashMap<(String, String), (Instant, Vec<Schedule>)>,
-    /// Cache the last valid checkin offset for each student.
-    /// Stores (offset, last_update_time) for each student.
+    /// Global cache for the last valid checkin offset.
+    /// Shared across all students, stores (offset, last_update_time).
     checkin_offset_cache: DashMap<String, (i64, Instant)>,
 }
 
@@ -327,10 +328,19 @@ impl ClassClient {
 
     /// Sign-in for `schedule_id` on behalf of `student_id`.
     pub async fn checkin(&self, student_id: &str, schedule_id: &str) -> AppResult<Value> {
-        // Try the cached offset first (if available and recent)
-        if let Some(entry) = self.checkin_offset_cache.get(student_id) {
+        // Use a fixed base timestamp for this whole checkin flow.
+        let base_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Try the global cached offset first (if available).
+        if let Some(entry) = self
+            .checkin_offset_cache
+            .get(GLOBAL_CHECKIN_OFFSET_CACHE_KEY)
+        {
             let (offset, _) = *entry;
-            match self.do_checkin(student_id, schedule_id, offset).await {
+            match self.do_checkin(student_id, schedule_id, offset, base_ts).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     // Check if this is an offset-related error
@@ -347,14 +357,18 @@ impl ClassClient {
 
         // Binary search for a valid offset
         info!(student = student_id, "binary searching for valid checkin offset");
-        let new_offset = self.binary_search_offset(student_id, schedule_id).await?;
+        let (new_offset, result) = self
+            .binary_search_offset(student_id, schedule_id, base_ts)
+            .await?;
         info!(student = student_id, offset = new_offset, "found valid offset");
-        
-        // Cache the found offset
-        self.checkin_offset_cache.insert(student_id.to_owned(), (new_offset, Instant::now()));
-        
-        // Perform the actual checkin with the found offset
-        self.do_checkin(student_id, schedule_id, new_offset).await
+
+        // Cache the found offset globally.
+        self.checkin_offset_cache.insert(
+            GLOBAL_CHECKIN_OFFSET_CACHE_KEY.to_owned(),
+            (new_offset, Instant::now()),
+        );
+
+        Ok(result)
     }
 
     /// Check if an error message suggests offset-related issues.
@@ -364,31 +378,33 @@ impl ClassClient {
     }
 
     /// Binary search for a valid offset in the range [CHECKIN_OFFSET_MIN, CHECKIN_OFFSET_MAX].
-    async fn binary_search_offset(&self, student_id: &str, schedule_id: &str) -> AppResult<i64> {
+    async fn binary_search_offset(
+        &self,
+        student_id: &str,
+        schedule_id: &str,
+        base_ts: i64,
+    ) -> AppResult<(i64, Value)> {
         let mut lo = CHECKIN_OFFSET_MIN;
-        let mut lo_err = "参数错误".to_string(); // Assume we start with too-small offset
+        let mut lo_err = "二维码已失效".to_string(); // Assume lower bound needs larger offset
         let mut hi = CHECKIN_OFFSET_MAX;
-        let mut hi_err = "二维码已失效".to_string(); // Assume we end with too-large offset
+        let mut hi_err = "参数错误".to_string(); // Assume upper bound needs smaller offset
 
         while lo < hi - 1 {
             let mid = (lo + hi) / 2;
-            match self.do_checkin(student_id, schedule_id, mid).await {
-                Ok(_) => {
-                    // Found a valid offset, but continue searching to find the boundary
-                    // (in case there's a specific valid range).
-                    // For simplicity, we'll accept the first valid one found.
-                    return Ok(mid);
+            match self.do_checkin(student_id, schedule_id, mid, base_ts).await {
+                Ok(result) => {
+                    return Ok((mid, result));
                 }
                 Err(err) => {
                     let msg = err.message.as_str();
                     if msg.contains("参数错误") {
-                        // Offset is too small, search in the upper half
-                        lo = mid;
-                        lo_err = msg.to_string();
-                    } else if msg.contains("二维码已失效") || msg.contains("已失效") {
-                        // Offset is too large, search in the lower half
+                        // Offset should be smaller (more negative), search lower half.
                         hi = mid;
                         hi_err = msg.to_string();
+                    } else if msg.contains("二维码已失效") || msg.contains("已失效") {
+                        // Offset should be larger (closer to zero), search upper half.
+                        lo = mid;
+                        lo_err = msg.to_string();
                     } else {
                         // Some other error, not offset-related
                         return Err(err);
@@ -402,8 +418,11 @@ impl ClassClient {
             if offset < CHECKIN_OFFSET_MIN || offset > CHECKIN_OFFSET_MAX {
                 continue;
             }
-            if let Ok(_) = self.do_checkin(student_id, schedule_id, offset).await {
-                return Ok(offset);
+            if let Ok(result) = self
+                .do_checkin(student_id, schedule_id, offset, base_ts)
+                .await
+            {
+                return Ok((offset, result));
             }
         }
 
@@ -414,16 +433,15 @@ impl ClassClient {
     }
 
     /// Perform a single checkin request with the given offset.
-    async fn do_checkin(&self, student_id: &str, schedule_id: &str, offset: i64) -> AppResult<Value> {
+    async fn do_checkin(
+        &self,
+        student_id: &str,
+        schedule_id: &str,
+        offset: i64,
+        base_ts: i64,
+    ) -> AppResult<Value> {
         let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
-        let ts = (
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-                + offset
-        )
-            .to_string();
+        let ts = (base_ts + offset).to_string();
         let sess = self.ensure_session(student_id).await?;
         let params = [
             ("id", sess.user_id.as_str()),

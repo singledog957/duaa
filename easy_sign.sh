@@ -30,7 +30,7 @@ UA="Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleW
 # Binary search constants for checkin offset
 CHECKIN_OFFSET_MIN=-15000
 CHECKIN_OFFSET_MAX=-1000
-OFFSET_CACHE_DIR="${STATE_DIR}/.offset_cache"
+OFFSET_CACHE_RELATIVE_DIR=".offset_cache"
 
 log() {
   printf "[%s] %s\n" "$(date '+%F %T')" "$*"
@@ -153,14 +153,19 @@ is_offset_error() {
   [[ "$msg" == *"参数错误"* ]] || [[ "$msg" == *"二维码已失效"* ]] || [[ "$msg" == *"已失效"* ]]
 }
 
+offset_cache_file() {
+  echo "${STATE_DIR}/${OFFSET_CACHE_RELATIVE_DIR}/global.offset"
+}
+
 # Perform a single checkin request with given offset
 do_checkin() {
   local user_id="$1"
   local session_id="$2"
   local sched_id="$3"
   local offset="$4"  # in milliseconds
+  local base_ts="$5" # fixed base timestamp in milliseconds
   local ts_ms
-  ts_ms="$(( $(date +%s%3N) + offset ))"
+  ts_ms="$(( base_ts + offset ))"
 
   curl -ks -X POST "${CHECKIN_URL}" \
     -H "Sessionid: ${session_id}" \
@@ -176,16 +181,17 @@ binary_search_offset() {
   local user_id="$1"
   local session_id="$2"
   local sched_id="$3"
+  local base_ts="$4"
   
   local lo=$CHECKIN_OFFSET_MIN
-  local lo_err="参数错误"
+  local lo_err="二维码已失效"
   local hi=$CHECKIN_OFFSET_MAX
-  local hi_err="二维码已失效"
+  local hi_err="参数错误"
   
   while [[ $((lo)) -lt $((hi - 1)) ]]; do
     local mid=$(( (lo + hi) / 2 ))
     local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$mid")"
+    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$mid" "$base_ts")"
     
     local status
     status="$(echo "$res" | jq -r '.STATUS // empty')"
@@ -200,13 +206,13 @@ binary_search_offset() {
     msg="$(echo "$res" | jq -r '.ERRMSG // empty')"
     
     if [[ "$msg" == *"参数错误"* ]]; then
-      # Offset too small, search upper half
-      lo=$mid
-      lo_err="$msg"
-    elif [[ "$msg" == *"二维码已失效"* ]] || [[ "$msg" == *"已失效"* ]]; then
-      # Offset too large, search lower half
+      # Offset should be smaller (more negative), search lower half
       hi=$mid
       hi_err="$msg"
+    elif [[ "$msg" == *"二维码已失效"* ]] || [[ "$msg" == *"已失效"* ]]; then
+      # Offset should be larger (closer to zero), search upper half
+      lo=$mid
+      lo_err="$msg"
     else
       # Other error, return failure
       echo "error: $msg" >&2
@@ -220,7 +226,7 @@ binary_search_offset() {
       continue
     fi
     local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$offset")"
+    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$offset" "$base_ts")"
     local status
     status="$(echo "$res" | jq -r '.STATUS // empty')"
     if [[ "$status" == "0" ]]; then
@@ -233,10 +239,10 @@ binary_search_offset() {
   return 1
 }
 
-# Get cached offset for student
+# Get global cached offset
 get_cached_offset() {
-  local student_id="$1"
-  local cache_file="${OFFSET_CACHE_DIR}/${student_id}.offset"
+  local cache_file
+  cache_file="$(offset_cache_file)"
   if [[ -f "$cache_file" ]]; then
     cat "$cache_file"
   else
@@ -244,27 +250,29 @@ get_cached_offset() {
   fi
 }
 
-# Save offset cache for student
+# Save global cached offset
 save_offset_cache() {
-  local student_id="$1"
-  local offset="$2"
-  mkdir -p "$OFFSET_CACHE_DIR"
-  echo "$offset" > "${OFFSET_CACHE_DIR}/${student_id}.offset"
+  local offset="$1"
+  local cache_file
+  cache_file="$(offset_cache_file)"
+  mkdir -p "$(dirname "$cache_file")"
+  echo "$offset" > "$cache_file"
 }
 
 checkin() {
   local user_id="$1"
   local session_id="$2"
   local sched_id="$3"
-  local second_offset="${4:-0}"
+  local base_ts
+  base_ts="$(date +%s%3N)"
   
   # Try cached offset first
   local cached_offset
-  cached_offset="$(get_cached_offset "$user_id")"
+  cached_offset="$(get_cached_offset)"
   
   if [[ -n "$cached_offset" ]]; then
     local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$cached_offset")"
+    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$cached_offset" "$base_ts")"
     local status
     status="$(echo "$res" | jq -r '.STATUS // empty')"
     
@@ -287,16 +295,16 @@ checkin() {
   # Need to search for valid offset
   log "[$user_id] searching for valid checkin offset..."
   local new_offset
-  new_offset="$(binary_search_offset "$user_id" "$session_id" "$sched_id")" || {
-    echo "{"\"ERRMSG\"\":\"\"Failed to find valid offset\"\"}" >&2
+  new_offset="$(binary_search_offset "$user_id" "$session_id" "$sched_id" "$base_ts")" || {
+    echo '{"ERRMSG":"Failed to find valid offset"}' >&2
     return 1
   }
   
   log "[$user_id] found valid offset: $new_offset"
-  save_offset_cache "$user_id" "$new_offset"
+  save_offset_cache "$new_offset"
   
   # Perform actual checkin with found offset
-  do_checkin "$user_id" "$session_id" "$sched_id" "$new_offset"
+  do_checkin "$user_id" "$session_id" "$sched_id" "$new_offset" "$base_ts"
 }
 
 # Convert "2026-03-12 14:00" to cron expression "0 14 12 3 *"
