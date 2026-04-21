@@ -24,13 +24,9 @@ SCRIPT_PATH="$SCRIPT_DIR/easy_sign.sh"
 LOGIN_URL="https://iclass.buaa.edu.cn:8347/app/user/login.action"
 SCHEDULE_URL="https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action"
 CHECKIN_URL="http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action"
+TIMESTAMP_URL="http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action"
 
 UA="Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light"
-
-# Binary search constants for checkin offset
-CHECKIN_OFFSET_MIN=-15000
-CHECKIN_OFFSET_MAX=-1000
-OFFSET_CACHE_RELATIVE_DIR=".offset_cache"
 
 log() {
   printf "[%s] %s\n" "$(date '+%F %T')" "$*"
@@ -147,25 +143,24 @@ query_schedule() {
     --data-urlencode "dateStr=${date_str}"
 }
 
-# Check if error message indicates offset-related issues
-is_offset_error() {
-  local msg="$1"
-  [[ "$msg" == *"参数错误"* ]] || [[ "$msg" == *"二维码已失效"* ]] || [[ "$msg" == *"已失效"* ]]
+# Fetch exact server timestamp from iclass
+get_server_timestamp() {
+  local raw ts
+  raw="$(curl -ks "$TIMESTAMP_URL")"
+  ts="$(echo "$raw" | jq -r '.timestamp // empty' 2>/dev/null || true)"
+  if [[ -z "$ts" || "$ts" == "null" ]]; then
+    echo "" >&2
+    return 1
+  fi
+  echo "$ts"
 }
 
-offset_cache_file() {
-  echo "${STATE_DIR}/${OFFSET_CACHE_RELATIVE_DIR}/global.offset"
-}
-
-# Perform a single checkin request with given offset
-do_checkin() {
+# Perform a single checkin request with the server timestamp
+do_checkin_with_ts() {
   local user_id="$1"
   local session_id="$2"
   local sched_id="$3"
-  local offset="$4"  # in milliseconds
-  local base_ts="$5" # fixed base timestamp in milliseconds
-  local ts_ms
-  ts_ms="$(( base_ts + offset ))"
+  local ts="$4"
 
   curl -ks -X POST "${CHECKIN_URL}" \
     -H "Sessionid: ${session_id}" \
@@ -173,138 +168,20 @@ do_checkin() {
     --get \
     --data-urlencode "id=${user_id}" \
     --data-urlencode "courseSchedId=${sched_id}" \
-    --data-urlencode "timestamp=${ts_ms}"
-}
-
-# Binary search for valid checkin offset
-binary_search_offset() {
-  local user_id="$1"
-  local session_id="$2"
-  local sched_id="$3"
-  local base_ts="$4"
-  
-  local lo=$CHECKIN_OFFSET_MIN
-  local lo_err="二维码已失效"
-  local hi=$CHECKIN_OFFSET_MAX
-  local hi_err="参数错误"
-  
-  while [[ $((lo)) -lt $((hi - 1)) ]]; do
-    local mid=$(( (lo + hi) / 2 ))
-    local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$mid" "$base_ts")"
-    
-    local status
-    status="$(echo "$res" | jq -r '.STATUS // empty')"
-    
-    if [[ "$status" == "0" ]]; then
-      # Found valid offset
-      echo "$mid"
-      return 0
-    fi
-    
-    local msg
-    msg="$(echo "$res" | jq -r '.ERRMSG // empty')"
-    
-    if [[ "$msg" == *"参数错误"* ]]; then
-      # Offset should be smaller (more negative), search lower half
-      hi=$mid
-      hi_err="$msg"
-    elif [[ "$msg" == *"二维码已失效"* ]] || [[ "$msg" == *"已失效"* ]]; then
-      # Offset should be larger (closer to zero), search upper half
-      lo=$mid
-      lo_err="$msg"
-    else
-      # Other error, return failure
-      echo "error: $msg" >&2
-      return 1
-    fi
-  done
-  
-  # Try remaining candidates
-  for offset in $lo $((lo + 1)) $((hi - 1)) $hi; do
-    if [[ $offset -lt $CHECKIN_OFFSET_MIN || $offset -gt $CHECKIN_OFFSET_MAX ]]; then
-      continue
-    fi
-    local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$offset" "$base_ts")"
-    local status
-    status="$(echo "$res" | jq -r '.STATUS // empty')"
-    if [[ "$status" == "0" ]]; then
-      echo "$offset"
-      return 0
-    fi
-  done
-  
-  echo "binary_search_failed" >&2
-  return 1
-}
-
-# Get global cached offset
-get_cached_offset() {
-  local cache_file
-  cache_file="$(offset_cache_file)"
-  if [[ -f "$cache_file" ]]; then
-    cat "$cache_file"
-  else
-    echo "" 
-  fi
-}
-
-# Save global cached offset
-save_offset_cache() {
-  local offset="$1"
-  local cache_file
-  cache_file="$(offset_cache_file)"
-  mkdir -p "$(dirname "$cache_file")"
-  echo "$offset" > "$cache_file"
+    --data-urlencode "timestamp=${ts}"
 }
 
 checkin() {
   local user_id="$1"
   local session_id="$2"
   local sched_id="$3"
-  local base_ts
-  base_ts="$(date +%s%3N)"
-  
-  # Try cached offset first
-  local cached_offset
-  cached_offset="$(get_cached_offset)"
-  
-  if [[ -n "$cached_offset" ]]; then
-    local res
-    res="$(do_checkin "$user_id" "$session_id" "$sched_id" "$cached_offset" "$base_ts")"
-    local status
-    status="$(echo "$res" | jq -r '.STATUS // empty')"
-    
-    if [[ "$status" == "0" ]]; then
-      # Cached offset still valid
-      echo "$res"
-      return 0
-    fi
-    
-    # Check if error is offset-related
-    local msg
-    msg="$(echo "$res" | jq -r '.ERRMSG // empty')"
-    if ! is_offset_error "$msg"; then
-      # Not offset error, return as-is
-      echo "$res"
-      return 0
-    fi
-  fi
-  
-  # Need to search for valid offset
-  log "[$user_id] searching for valid checkin offset..."
-  local new_offset
-  new_offset="$(binary_search_offset "$user_id" "$session_id" "$sched_id" "$base_ts")" || {
-    echo '{"ERRMSG":"Failed to find valid offset"}' >&2
+  local ts
+  ts="$(get_server_timestamp)" || {
+    echo '{"ERRMSG":"Failed to get server timestamp"}' >&2
     return 1
   }
-  
-  log "[$user_id] found valid offset: $new_offset"
-  save_offset_cache "$new_offset"
-  
-  # Perform actual checkin with found offset
-  do_checkin "$user_id" "$session_id" "$sched_id" "$new_offset" "$base_ts"
+
+  do_checkin_with_ts "$user_id" "$session_id" "$sched_id" "$ts"
 }
 
 # Convert "2026-03-12 14:00" to cron expression "0 14 12 3 *"

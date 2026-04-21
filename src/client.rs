@@ -108,17 +108,11 @@ impl CourseSchedule {
 // ── ClassClient ───────────────────────────────────────────────────────────────
 
 const SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const CHECKIN_OFFSET_MIN: i64 = -15_000;
-const CHECKIN_OFFSET_MAX: i64 = -1_000;
-const GLOBAL_CHECKIN_OFFSET_CACHE_KEY: &str = "global";
 
 pub struct ClassClient {
     http: Client,
     sessions: DashMap<String, Session>,
     schedule_cache: DashMap<(String, String), (Instant, Vec<Schedule>)>,
-    /// Global cache for the last valid checkin offset.
-    /// Shared across all students, stores (offset, last_update_time).
-    checkin_offset_cache: DashMap<String, (i64, Instant)>,
 }
 
 const FALLBACK_MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36";
@@ -178,7 +172,6 @@ impl ClassClient {
             http,
             sessions: DashMap::new(),
             schedule_cache: DashMap::new(),
-            checkin_offset_cache: DashMap::new(),
         }
     }
 
@@ -328,45 +321,88 @@ impl ClassClient {
 
     /// Sign-in for `schedule_id` on behalf of `student_id`.
     pub async fn checkin(&self, student_id: &str, schedule_id: &str) -> AppResult<Value> {
-        // Use a fixed base timestamp for this whole checkin flow.
-        let base_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        // Get the server's accurate timestamp directly from iclass
+        let ts = self.get_server_timestamp().await?;
+        info!(student = student_id, "acquired server timestamp for checkin");
+        
+        // Perform checkin with the server timestamp
+        self.do_checkin_with_ts(student_id, schedule_id, &ts).await
+    }
 
-        // Try the global cached offset first (if available).
-        if let Some(entry) = self
-            .checkin_offset_cache
-            .get(GLOBAL_CHECKIN_OFFSET_CACHE_KEY)
-        {
-            let (offset, _) = *entry;
-            match self.do_checkin(student_id, schedule_id, offset, base_ts).await {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    // Check if this is an offset-related error
-                    if self.is_offset_error(&err) {
-                        debug!(student = student_id, "cached offset invalid, starting binary search");
-                        // Fall through to binary search
-                    } else {
-                        // Other errors should not trigger offset search
-                        return Err(err);
-                    }
+    /// Get the server's accurate timestamp from iclass.
+    async fn get_server_timestamp(&self) -> AppResult<String> {
+        let url = "http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action";
+        let val: Value = self.http.get(url).send().await?.json().await?;
+        if let Some(ts_val) = val.get("timestamp") {
+            // Handle both string and numeric timestamp formats
+            let ts_str = if let Some(s) = ts_val.as_str() {
+                s.to_string()
+            } else if let Some(n) = ts_val.as_i64() {
+                n.to_string()
+            } else if let Some(n) = ts_val.as_u64() {
+                n.to_string()
+            } else {
+                return Err(AppError::remote("Failed to parse timestamp value from server"));
+            };
+            debug!(ts = &ts_str, "acquired server timestamp");
+            Ok(ts_str)
+        } else {
+            Err(AppError::remote("Failed to parse timestamp from server response"))
+        }
+    }
+
+    /// Perform checkin with a given timestamp string.
+    async fn do_checkin_with_ts(
+        &self,
+        student_id: &str,
+        schedule_id: &str,
+        ts: &str,
+    ) -> AppResult<Value> {
+        let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
+        let sess = self.ensure_session(student_id).await?;
+        let params = [
+            ("id", sess.user_id.as_str()),
+            ("courseSchedId", schedule_id),
+            ("timestamp", ts),
+        ];
+        let res = self
+            .http
+            .post(url)
+            .header("Sessionid", &sess.session_id)
+            .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
+            .query(&params)
+            .send()
+            .await?
+            .json::<ClassRes<Value>>()
+            .await;
+
+        let result = match res {
+            Ok(r) => {
+                if r.status == "4001" || r.status == "401" {
+                    warn!(student_id, "session expired, re-logging in");
+                    self.sessions.remove(student_id);
+                    let sess2 = self.ensure_session(student_id).await?;
+                    let retry_params = [
+                        ("id", sess2.user_id.as_str()),
+                        ("courseSchedId", schedule_id),
+                        ("timestamp", ts),
+                    ];
+                    self.http
+                        .post(url)
+                        .header("Sessionid", &sess2.session_id)
+                        .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
+                        .query(&retry_params)
+                        .send()
+                        .await?
+                        .json::<ClassRes<Value>>()
+                        .await?
+                        .take()?
+                } else {
+                    r.take()?
                 }
             }
-        }
-
-        // Binary search for a valid offset
-        info!(student = student_id, "binary searching for valid checkin offset");
-        let (new_offset, result) = self
-            .binary_search_offset(student_id, schedule_id, base_ts)
-            .await?;
-        info!(student = student_id, offset = new_offset, "found valid offset");
-
-        // Cache the found offset globally.
-        self.checkin_offset_cache.insert(
-            GLOBAL_CHECKIN_OFFSET_CACHE_KEY.to_owned(),
-            (new_offset, Instant::now()),
-        );
+            Err(e) => return Err(e.into()),
+        };
 
         Ok(result)
     }
@@ -384,55 +420,12 @@ impl ClassClient {
         schedule_id: &str,
         base_ts: i64,
     ) -> AppResult<(i64, Value)> {
-        let mut lo = CHECKIN_OFFSET_MIN;
-        let mut lo_err = "二维码已失效".to_string(); // Assume lower bound needs larger offset
-        let mut hi = CHECKIN_OFFSET_MAX;
-        let mut hi_err = "参数错误".to_string(); // Assume upper bound needs smaller offset
-
-        while lo < hi - 1 {
-            let mid = (lo + hi) / 2;
-            match self.do_checkin(student_id, schedule_id, mid, base_ts).await {
-                Ok(result) => {
-                    return Ok((mid, result));
-                }
-                Err(err) => {
-                    let msg = err.message.as_str();
-                    if msg.contains("参数错误") {
-                        // Offset should be smaller (more negative), search lower half.
-                        hi = mid;
-                        hi_err = msg.to_string();
-                    } else if msg.contains("二维码已失效") || msg.contains("已失效") {
-                        // Offset should be larger (closer to zero), search upper half.
-                        lo = mid;
-                        lo_err = msg.to_string();
-                    } else {
-                        // Some other error, not offset-related
-                        return Err(err);
-                    }
-                }
-            }
-        }
-
-        // If we've exhausted the search, try the remaining candidates
-        for offset in [lo, lo + 1, hi - 1, hi].iter().copied() {
-            if offset < CHECKIN_OFFSET_MIN || offset > CHECKIN_OFFSET_MAX {
-                continue;
-            }
-            if let Ok(result) = self
-                .do_checkin(student_id, schedule_id, offset, base_ts)
-                .await
-            {
-                return Ok((offset, result));
-            }
-        }
-
-        Err(AppError::remote(format!(
-            "binary search failed: lo={} ({}), hi={} ({})",
-            lo, lo_err, hi, hi_err
-        )))
+        // Deprecated: This method is no longer used. Use get_server_timestamp() and do_checkin_with_ts() instead.
+        Err(AppError::remote("binary search offset is deprecated"))
     }
 
-    /// Perform a single checkin request with the given offset.
+    /// Deprecated: Perform a single checkin request with the given offset (kept for reference, no longer used).
+    #[allow(dead_code)]
     async fn do_checkin(
         &self,
         student_id: &str,
