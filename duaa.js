@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         不智慧教室
-// @version      2.4
+// @version      2.5
 // @description  Bypass CORS to allow local sign
 // @author       singledog
 // @match        https://duaa.singledog233.top/*
@@ -126,6 +126,7 @@
             course_id: s.courseId,
             name: s.courseName,
             teacher: s.teacherName,
+            classroom_name: s.classroomName || '',
             time: toIso(s.classBeginTime),
             end_time: toIso(s.classEndTime),
             status: s.signStatus === '1' ? 1 : 0,
@@ -138,33 +139,13 @@
         }
     }
 
-    function isOffsetError(err) {
-        const msg = String((err && err.message) || err || '')
-        return msg.includes('参数错误') || msg.includes('二维码已失效') || msg.includes('已失效')
-    }
-
-    async function getServerTimestamp() {
-        const res = await gmReq({ method: 'GET', url: `${SIGN_BASE}/app/common/get_timestamp.action` })
-        const raw = JSON.parse(res.responseText)
-        const ts = raw && raw.timestamp
-        if (ts === undefined || ts === null || ts === '') {
-            throw new Error('Failed to parse timestamp from server response')
-        }
-        return String(ts)
-    }
-
-    async function doCheckinWithTs(studentId, scheduleId, ts) {
-        return iclassRequest(
-            studentId,
-            `${SIGN_BASE}/app/course/stu_scan_sign.action`,
-            { courseSchedId: scheduleId, timestamp: String(ts) },
-        )
-    }
-
     // ── Bridge：手动签到 ──────────────────────────────────────────────────────────
     async function checkin(studentId, scheduleId) {
-        const ts = await getServerTimestamp()
-        await doCheckinWithTs(studentId, scheduleId, ts)
+        await iclassRequest(
+            studentId,
+            `${SIGN_BASE}/app/course/stu_scan_sign.action`,
+            { courseSchedId: scheduleId, timestamp: String(Date.now()) },
+        )
     }
 
     // ── 暴露桥接对象到页面 window ─────────────────────────────────────────────────
