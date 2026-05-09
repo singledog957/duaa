@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         不智慧教室
-// @version      2.5
+// @version      2.6
 // @description  Bypass CORS to allow local sign
 // @author       singledog
 // @match        https://duaa.singledog233.top/*
@@ -50,6 +50,12 @@
         if (!s) return ''
         const base = s.length === 16 ? s + ':00' : s
         return base.replace(' ', 'T') + '+08:00'
+    }
+
+    function matchSchedule(sched, targets) {
+        const idMatch = targets.includes(sched.course_id) || targets.includes(sched.id)
+        if (idMatch) return true
+        return targets.includes(sched.name)
     }
 
     // ── 令牌缓存（以学号为 key） ──────────────────────────────────────────────────
@@ -149,5 +155,5 @@
     }
 
     // ── 暴露桥接对象到页面 window ─────────────────────────────────────────────────
-    unsafeWindow.__checkinBridge = { querySchedule, checkin }
+    unsafeWindow.__checkinBridge = { querySchedule, checkin, matchSchedule }
 })()

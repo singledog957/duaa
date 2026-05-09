@@ -359,7 +359,15 @@ phase_query() {
     # Filter by configured course_ids and unsigned classes
     filtered="$(jq -c --argjson ids "$(echo "$stu" | jq '.course_ids')" '
       .result // []
-      | map(select((.courseId as $cid | $ids | index($cid)) != null))
+      | map(select(
+          ((.courseId as $cid | $ids | index($cid)) != null)
+          or ((.id as $sid | $ids | index($sid)) != null)
+          or (
+            ((.courseId as $cid | $ids | index($cid)) == null)
+            and ((.id as $sid | $ids | index($sid)) == null)
+            and ((.courseName as $name | $ids | index($name)) != null)
+          )
+        ))
       | map(select((.signStatus // "0") != "1"))
     ' <<<"$day_resp")"
 

@@ -39,10 +39,15 @@ pub async fn plan_tasks(
     course_ids: &[String],
 ) {
     let now = super::now_secs();
+    let registered_names: std::collections::HashSet<&str> = course_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
 
     for sched in schedules {
         // Only schedule for courses the student has registered for auto-checkin.
-        if !course_ids.contains(&sched.course_id) {
+        let id_match = course_ids.contains(&sched.course_id) || course_ids.contains(&sched.id);
+        if !id_match && !registered_names.contains(sched.name.as_str()) {
             continue;
         }
         // Don't enqueue if already signed.
