@@ -52,6 +52,14 @@
         return base.replace(' ', 'T') + '+08:00'
     }
 
+    async function getServerTimestamp() {
+        const res = await gmReq({ method: 'GET', url: `${SIGN_BASE}/app/common/get_timestamp.action` })
+        const j = JSON.parse(res.responseText)
+        const ts = j && j.timestamp
+        if (ts === undefined || ts === null) throw new Error('timestamp missing')
+        return String(ts)
+    }
+
     function matchSchedule(sched, targets) {
         const idMatch = targets.includes(sched.course_id) || targets.includes(sched.id)
         if (idMatch) return true
@@ -147,10 +155,11 @@
 
     // ── Bridge：手动签到 ──────────────────────────────────────────────────────────
     async function checkin(studentId, scheduleId) {
+        const ts = await getServerTimestamp()
         await iclassRequest(
             studentId,
             `${SIGN_BASE}/app/course/stu_scan_sign.action`,
-            { courseSchedId: scheduleId, timestamp: String(Date.now()) },
+            { courseSchedId: scheduleId, timestamp: ts },
         )
     }
 

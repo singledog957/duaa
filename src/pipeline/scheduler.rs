@@ -39,14 +39,20 @@ pub async fn plan_tasks(
     course_ids: &[String],
 ) {
     let now = super::now_secs();
-    let registered_names: std::collections::HashSet<&str> = course_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let mut registered_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut registered_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in course_ids {
+        if entry.chars().all(|c| c.is_ascii_digit()) {
+            registered_ids.insert(entry.as_str());
+        } else {
+            registered_names.insert(entry.as_str());
+        }
+    }
 
     for sched in schedules {
         // Only schedule for courses the student has registered for auto-checkin.
-        let id_match = course_ids.contains(&sched.course_id) || course_ids.contains(&sched.id);
+        let id_match = registered_ids.contains(sched.course_id.as_str())
+            || registered_ids.contains(sched.id.as_str());
         if !id_match && !registered_names.contains(sched.name.as_str()) {
             continue;
         }
