@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         不智慧教室
 // @version      2.6
-// @description  Bypass CORS to allow local sign
+// @description  Bypass CORS to allow local in-campus query/checkin for the frontend
 // @author       singledog
 // @match        https://duaa.singledog233.top/*
 // @grant        GM_setValue
@@ -19,6 +19,7 @@
     'use strict'
 
     // ── 端点常量 ──────────────────────────────────────────────────────────────────
+    const LOGIN_BASE = 'https://iclass.buaa.edu.cn:8346'
     const BASE = 'https://iclass.buaa.edu.cn:8347'
     const SIGN_BASE = 'http://iclass.buaa.edu.cn:8081'
 
@@ -33,6 +34,19 @@
                 ontimeout: () => reject(new Error('Request timeout')),
             })
         })
+    }
+
+    function ssoRequiredError(message) {
+        return {
+            response: {
+                data: {
+                    error: {
+                        code: 'login_sso_required',
+                        message,
+                    },
+                },
+            },
+        }
     }
 
     // ── 解析 iclass 统一响应格式 ──────────────────────────────────────────────────
@@ -52,9 +66,15 @@
         return base.replace(' ', 'T') + '+08:00'
     }
 
-    async function getServerTimestamp() {
-        const res = await gmReq({ method: 'GET', url: `${SIGN_BASE}/app/common/get_timestamp.action` })
+    async function getServerTimestamp(studentId) {
+        const tk = await ensureToken(studentId)
+        const res = await gmReq({
+            method: 'POST',
+            url: `${SIGN_BASE}/app/common/get_timestamp.action?id=${encodeURIComponent(tk.classId)}`,
+            headers: { Sessionid: tk.loginName },
+        })
         const j = JSON.parse(res.responseText)
+        if (j.STATUS && j.STATUS !== '0') throw new Error(j.ERRMSG || `iclass STATUS=${j.STATUS}`)
         const ts = j && j.timestamp
         if (ts === undefined || ts === null) throw new Error('timestamp missing')
         return String(ts)
@@ -73,20 +93,35 @@
     }
     function saveToken(sid, tk) { GM_setValue(`tk:${sid}`, JSON.stringify(tk)) }
     function clearToken(sid) { GM_setValue(`tk:${sid}`, null) }
+    function loadLoginName(sid) { return GM_getValue(`login_name:${sid}`, '') || '' }
+    function saveLoginName(sid, loginName) { GM_setValue(`login_name:${sid}`, loginName || '') }
+    function clearLoginName(sid) { GM_setValue(`login_name:${sid}`, '') }
 
-    // ── Passwordless iclass 登录（仅需学号，校内网有效）─────────────────────────
     async function login(studentId) {
+        const savedLoginName = loadLoginName(studentId)
+        const loginName = savedLoginName || studentId
         const qs = new URLSearchParams({
-            phone: studentId,
+            phone: loginName,
             password: '',
             verificationType: '2',
             verificationUrl: '',
             userLevel: '1',
         })
-        const res = await gmReq({ method: 'GET', url: `${BASE}/app/user/login.action?${qs}` })
-        const result = parseIclass(res.responseText)
-        if (!result || !result.id) throw new Error('登录失败：未获取到 token')
-        const tk = { userId: result.id, sessionId: result.sessionId, realName: result.realName }
+        let result
+        try {
+            const res = await gmReq({ method: 'GET', url: `${LOGIN_BASE}/eschool/app/user/login_buaa.do?${qs}` })
+            result = parseIclass(res.responseText)
+        } catch (e) {
+            if (savedLoginName) {
+                clearLoginName(studentId)
+                clearToken(studentId)
+                throw ssoRequiredError('保存的 loginName 已失效，请重新完成一次 SSO 跳转')
+            }
+            const message = e instanceof Error ? e.message : '请先完成一次 SSO 跳转'
+            throw ssoRequiredError(message)
+        }
+        if (!result || !result.id) throw new Error('登录失败：未获取到 class id')
+        const tk = { classId: result.id, loginName, realName: result.realName || studentId }
         saveToken(studentId, tk)
         return tk
     }
@@ -100,11 +135,11 @@
     // iclass 使用 GET/POST 均可；此处与 Rust 后端保持一致，使用 POST
     async function iclassRequest(studentId, url, params) {
         async function doReq(tk) {
-            const qs = new URLSearchParams({ id: tk.userId, ...params })
+            const qs = new URLSearchParams({ id: tk.classId, ...params })
             return gmReq({
                 method: 'POST',
                 url: `${url}?${qs}`,
-                headers: { Sessionid: tk.sessionId },
+                headers: { Sessionid: tk.loginName },
             })
         }
 
@@ -155,14 +190,14 @@
 
     // ── Bridge：手动签到 ──────────────────────────────────────────────────────────
     async function checkin(studentId, scheduleId) {
-        const ts = await getServerTimestamp()
+        const ts = await getServerTimestamp(studentId)
         await iclassRequest(
             studentId,
-            `${SIGN_BASE}/app/course/stu_scan_sign.action`,
+            `${SIGN_BASE}/eschool/app/course/stu_scan_sign.action`,
             { courseSchedId: scheduleId, timestamp: ts },
         )
     }
 
     // ── 暴露桥接对象到页面 window ─────────────────────────────────────────────────
-    unsafeWindow.__checkinBridge = { querySchedule, checkin, matchSchedule }
+    unsafeWindow.__checkinBridge = { querySchedule, checkin, matchSchedule, saveLoginName }
 })()

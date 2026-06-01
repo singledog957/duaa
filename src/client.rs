@@ -1,15 +1,31 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use rand::Rng;
-use reqwest::Client;
+use reqwest::{header::LOCATION, redirect::Policy, Client};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    config::StudentEntry,
+    error::{AppError, AppResult},
+};
 
-// ── iclass response envelope ──────────────────────────────────────────────────
+const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
+    "AppleWebKit/537.36 (KHTML, like Gecko) ",
+    "Chrome/130.0.0.0 Safari/537.36"
+);
+
+const SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SSO_LOGIN_URL: &str = "https://sso.buaa.edu.cn/login";
+const SSO_VERIFY_URL: &str = "https://uc.buaa.edu.cn/";
+const JUMP_URL: &str = "https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter";
+const LOGIN_BUAA_URL: &str = "https://iclass.buaa.edu.cn:8346/eschool/app/user/login_buaa.do";
+const SCHEDULE_URL: &str = "https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action";
+const COURSE_DETAIL_URL: &str = "https://iclass.buaa.edu.cn:8347/app/my/get_my_course_sign_detail.action";
+const TIMESTAMP_URL: &str = "http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action";
+const CHECKIN_URL: &str = "http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action";
 
 #[derive(Deserialize)]
 struct ClassRes<T> {
@@ -22,46 +38,50 @@ struct ClassRes<T> {
     result: Option<T>,
 }
 
-impl<T: for<'de> Deserialize<'de>> ClassRes<T> {
-    fn take(self) -> AppResult<T> {
-        if self.status != "0" {
-            // ERRCODE 106 = user does not exist
-            if self.errcode.as_deref() == Some("106") {
-                return Err(AppError::not_found("用户不存在，请检查学号"));
+impl<T> ClassRes<T> {
+    fn check(self) -> AppResult<Self> {
+        match self.status.as_str() {
+            "0" => Ok(self),
+            "2" => Err(AppError::remote("iclass status=2 msg=Some(\"Empty data list\")")),
+            _ => {
+                if self.errcode.as_deref() == Some("106") {
+                    return Err(AppError::not_found("用户不存在，请检查学号"));
+                }
+                Err(AppError::remote(format!(
+                    "iclass status={} msg={:?}",
+                    self.status, self.msg
+                )))
             }
-            return Err(AppError::remote(format!(
-                "iclass status={} msg={:?}",
-                self.status, self.msg
-            )));
         }
-        self.result
+    }
+
+    fn take(self) -> AppResult<T> {
+        self.check()?
+            .result
             .ok_or_else(|| AppError::remote("iclass returned no result"))
     }
 }
 
-// ── per-student session ───────────────────────────────────────────────────────
-
 #[derive(Clone)]
 struct Session {
-    user_id: String,
-    session_id: String,
+    class_id: String,
+    login_name: String,
     real_name: String,
 }
 
-// ── login response ────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct Account {
+    student_id: String,
+    sso_password: String,
+}
 
 #[derive(Deserialize)]
 struct LoginResult {
     id: String,
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    #[serde(rename = "realName")]
-    pub real_name: String,
+    #[serde(rename = "realName", default)]
+    real_name: String,
 }
 
-// ── public data structures ────────────────────────────────────────────────────
-
-/// One entry from the day-schedule endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Schedule {
     #[serde(rename = "id")]
@@ -72,12 +92,10 @@ pub struct Schedule {
     pub name: String,
     #[serde(rename = "teacherName")]
     pub teacher: String,
-    /// Raw "YYYY-MM-DD HH:MM[:SS]" as returned by iclass.
     #[serde(rename = "classBeginTime")]
     pub time: String,
     #[serde(rename = "classEndTime")]
     pub end_time: Option<String>,
-    /// "0" or "1" – kept as String to be deserialized leniently.
     #[serde(rename = "signStatus", default)]
     pub status_raw: String,
 }
@@ -88,7 +106,6 @@ impl Schedule {
     }
 }
 
-/// One entry from the course-schedule (all sessions of a course) endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CourseSchedule {
     #[serde(rename = "courseSchedId")]
@@ -105,119 +122,176 @@ impl CourseSchedule {
     }
 }
 
-// ── ClassClient ───────────────────────────────────────────────────────────────
-
-const SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
 pub struct ClassClient {
     http: Client,
+    sso_http: Client,
     sessions: DashMap<String, Session>,
     schedule_cache: DashMap<(String, String), (Instant, Vec<Schedule>)>,
-}
-
-const FALLBACK_MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36";
-const CHECKIN_PY_LIKE_UA: &str = "Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 wxwork/4.1.22 MicroMessenger/7.0.1 NetType/WIFI Language/zh ColorScheme/Light";
-
-const MOBILE_WECHAT_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Linux; Android 9; COL-AL10 Build/HUAWEICOL-AL10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/85.0.3527.52 MQQBrowser/6.2 TBS/044607 Mobile Safari/537.36 MMWEBID/7140 MicroMessenger/7.0.4.1420(0x27000437) Process/tools NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (Linux; Android 13; V2148A Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160117 MMWEBSDK/20240404 MMWEBID/8833 MicroMessenger/8.0.49.2600(0x28003137) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 12; NOH-AL00 Build/HUAWEINOH-AL00; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160117 MMWEBSDK/20240404 MMWEBID/6916 MicroMessenger/8.0.49.2600(0x28003136) WeChat/arm64 Weixin NetType/4G Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 14; V2307A Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160117 MMWEBSDK/20240301 MMWEBID/4922 MicroMessenger/8.0.48.2580(0x28003052) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 13; 23049RAD8C Build/TKQ1.221114.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160083 MMWEBSDK/20230303 MMWEBID/4466 MicroMessenger/8.0.34.2340(0x2800225F) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 10; PBEM00 Build/QKQ1.190918.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160083 MMWEBSDK/20240301 MMWEBID/3124 MicroMessenger/8.0.48.2580(0x2800303F) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 13; V2024A Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160117 MMWEBSDK/20240301 MMWEBID/2429 MicroMessenger/8.0.48.2580(0x28003050) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 13; V2304A Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 XWEB/1160083 MMWEBSDK/20240301 MMWEBID/195 MicroMessenger/8.0.48.2580(0x2800303F) WeChat/arm64 Weixin NetType/5G Language/zh_CN ABI/arm64",
-    "Mozilla/5.0 (Linux; Android 9; COL-AL10 Build/HUAWEICOL-AL10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/58.0.4467.59 MQQBrowser/6.2 TBS/044607 Mobile Safari/537.36 MMWEBID/7140 MicroMessenger/7.0.4.1420(0x27000437) Process/tools NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (Linux; Android 9; COL-AL10 Build/HUAWEICOL-AL10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/56.0.3545.100 MQQBrowser/6.2 TBS/044607 Mobile Safari/537.36 MMWEBID/7140 MicroMessenger/7.0.4.1420(0x27000437) Process/tools NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x18003127) NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x18003127) NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x18003030) NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.42(0x18002a32) NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x1800302c) NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x18003129) NetType/4G Language/zh_HK",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x18003030) NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_8_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x18003030) NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x18003030) NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x1800312a) NetType/WIFI Language/zh_CN",
-];
-
-fn select_mobile_ua_from_pool<'a>(pool: &'a [&'a str]) -> Option<&'a str> {
-    if pool.is_empty() {
-        return None;
-    }
-    let idx = rand::rng().random_range(0..pool.len());
-    pool.get(idx).copied()
-}
-
-fn mobile_user_agent() -> &'static str {
-    select_mobile_ua_from_pool(MOBILE_WECHAT_USER_AGENTS).unwrap_or(FALLBACK_MOBILE_UA)
-}
-
-fn ua_kind(ua: &str) -> &'static str {
-    if ua.contains("iPhone") {
-        "iphone"
-    } else {
-        "android"
-    }
+    accounts: DashMap<String, Account>,
 }
 
 impl ClassClient {
-    pub fn new() -> Self {
+    pub fn new(students: &[StudentEntry]) -> Self {
         let http = Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(15))
+            .user_agent(USER_AGENT)
             .build()
             .expect("build reqwest client");
-        Self {
+        let sso_http = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(20))
+            .user_agent(USER_AGENT)
+            .redirect(Policy::none())
+            .cookie_store(true)
+            .build()
+            .expect("build sso client");
+
+        let client = Self {
             http,
+            sso_http,
             sessions: DashMap::new(),
             schedule_cache: DashMap::new(),
+            accounts: DashMap::new(),
+        };
+        for student in students {
+            client.accounts.insert(
+                student.student_id.clone(),
+                Account {
+                    student_id: student.student_id.clone(),
+                    sso_password: student.sso_password.clone(),
+                },
+            );
         }
+        client
     }
 
-    // ── auth ──────────────────────────────────────────────────────────────────
+    fn account(&self, student_id: &str) -> AppResult<Account> {
+        self.accounts
+            .get(student_id)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| AppError::not_found("配置中不存在该学号"))
+    }
 
-    /// Passwordless iclass login; returns the student's real name.
-    pub async fn login(&self, student_id: &str) -> AppResult<String> {
-        let url = "https://iclass.buaa.edu.cn:8347/app/user/login.action";
-        let ua = mobile_user_agent();
-        debug!(student_id, ua_kind = ua_kind(ua), "selected mobile UA for login request");
+    async fn sso_login(&self, account: &Account) -> AppResult<()> {
+        let res = self.sso_http.get(SSO_LOGIN_URL).send().await?;
+        if res.url().as_str() == SSO_VERIFY_URL {
+            return Ok(());
+        }
+
+        let bytes = res.bytes().await?;
+        let html = String::from_utf8_lossy(&bytes);
+        let execution = extract_input_value(&html, "execution")
+            .ok_or_else(|| AppError::remote("SSO 登录页缺少 execution"))?;
+
+        let form = [
+            ("username", account.student_id.as_str()),
+            ("password", account.sso_password.as_str()),
+            ("submit", "登录"),
+            ("type", "username_password"),
+            ("execution", execution.as_str()),
+            ("_eventId", "submit"),
+        ];
+        let form_body = serde_urlencoded::to_string(form)
+            .map_err(|e| AppError::internal(format!("encode sso form failed: {e}")))?;
+
+        let res = self
+            .sso_http
+            .post(SSO_LOGIN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body)
+            .send()
+            .await?;
+        if res.status().is_success() {
+            return Ok(());
+        }
+
+        let bytes = res.bytes().await?;
+        let html = String::from_utf8_lossy(&bytes);
+        if html.contains("continueForm") {
+            let execution = extract_input_value(&html, "execution").ok_or_else(|| {
+                AppError::remote("SSO 风险继续页缺少 execution")
+            })?;
+            let form = [("execution", execution.as_str()), ("_eventId", "ignoreAndContinue")];
+            let form_body = serde_urlencoded::to_string(form)
+                .map_err(|e| AppError::internal(format!("encode sso continue form failed: {e}")))?;
+            let retry = self
+                .sso_http
+                .post(SSO_LOGIN_URL)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(form_body)
+                .send()
+                .await?;
+            if retry.status().is_success() {
+                return Ok(());
+            }
+        }
+
+        Err(AppError::remote("SSO 登录失败，请检查学号或密码"))
+    }
+
+    async fn fetch_login_name(&self, student_id: &str) -> AppResult<String> {
+        let res = self.sso_http.get(JUMP_URL).send().await?;
+        let final_url = if res.status().is_redirection() {
+            res.headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| res.url().as_str().to_string())
+        } else {
+            res.url().as_str().to_string()
+        };
+
+        extract_login_name_from_url(&final_url)
+            .ok_or_else(|| AppError::remote(format!("未能为 {student_id} 解析 login_name")))
+    }
+
+    async fn login_with_login_name(&self, login_name: &str) -> AppResult<LoginResult> {
         let params = [
-            ("phone", student_id),
+            ("phone", login_name),
             ("password", ""),
             ("verificationType", "2"),
             ("verificationUrl", ""),
             ("userLevel", "1"),
         ];
-        let res = self
-            .http
-            .get(url)
-            .header(reqwest::header::USER_AGENT, ua)
+
+        self.http
+            .get(LOGIN_BUAA_URL)
             .query(&params)
             .send()
             .await?
             .json::<ClassRes<LoginResult>>()
-            .await?;
-        let lr = res.take()?;
-        let name = lr.real_name.clone();
+            .await?
+            .take()
+    }
+
+    pub async fn login(&self, student_id: &str) -> AppResult<String> {
+        let account = self.account(student_id)?;
+        self.sso_login(&account).await?;
+        let login_name = self.fetch_login_name(student_id).await?;
+        let login = self.login_with_login_name(&login_name).await?;
+        let real_name = if login.real_name.trim().is_empty() {
+            student_id.to_owned()
+        } else {
+            login.real_name.clone()
+        };
+
         self.sessions.insert(
             student_id.to_owned(),
             Session {
-                user_id: lr.id,
-                session_id: lr.session_id,
-                real_name: lr.real_name.clone(),
+                class_id: login.id,
+                login_name,
+                real_name: real_name.clone(),
             },
         );
-        info!(student_id, "iclass login ok");
-        Ok(name)
+        info!(student_id = %student_id, "iclass login ok via auto sso");
+        Ok(real_name)
     }
 
-    /// Return the student's real name (logs in if session not cached).
     pub async fn student_name(&self, student_id: &str) -> AppResult<String> {
         Ok(self.ensure_session(student_id).await?.real_name)
     }
 
-    /// Ensure session exists, re-logging in if necessary.
     async fn ensure_session(&self, student_id: &str) -> AppResult<Session> {
         if let Some(s) = self.sessions.get(student_id) {
             return Ok(s.clone());
@@ -229,7 +303,11 @@ impl ClassClient {
             .ok_or_else(|| AppError::internal("session missing after login"))
     }
 
-    /// POST to iclass with automatic session re-login on auth failure.
+    fn clear_student_state(&self, student_id: &str) {
+        self.sessions.remove(student_id);
+        self.schedule_cache.retain(|(sid, _), _| sid != student_id);
+    }
+
     async fn iclass_post<T: for<'de> Deserialize<'de>>(
         &self,
         student_id: &str,
@@ -237,13 +315,10 @@ impl ClassClient {
         params: &[(&str, &str)],
     ) -> AppResult<T> {
         let sess = self.ensure_session(student_id).await?;
-        let ua = mobile_user_agent();
-        debug!(student_id, ua_kind = ua_kind(ua), "selected mobile UA for upstream request");
         let res = self
             .http
-            .post(format!("{url}?id={}", sess.user_id))
-            .header("Sessionid", &sess.session_id)
-            .header(reqwest::header::USER_AGENT, ua)
+            .post(format!("{url}?id={}", sess.class_id))
+            .header("Sessionid", &sess.login_name)
             .query(params)
             .send()
             .await?
@@ -253,17 +328,13 @@ impl ClassClient {
         match res {
             Ok(r) => {
                 if r.status == "4001" || r.status == "401" {
-                    // Session expired – evict and retry once.
-                    warn!(student_id, "session expired, re-logging in");
-                    self.sessions.remove(student_id);
+                    warn!(student_id = %student_id, "session expired, re-logging in");
+                    self.clear_student_state(student_id);
                     let sess2 = self.ensure_session(student_id).await?;
-                    let ua_retry = mobile_user_agent();
-                    debug!(student_id, ua_kind = ua_kind(ua_retry), "selected mobile UA for retry request");
                     return self
                         .http
-                        .post(format!("{url}?id={}", sess2.user_id))
-                        .header("Sessionid", &sess2.session_id)
-                        .header(reqwest::header::USER_AGENT, ua_retry)
+                        .post(format!("{url}?id={}", sess2.class_id))
+                        .header("Sessionid", &sess2.login_name)
                         .query(params)
                         .send()
                         .await?
@@ -277,99 +348,98 @@ impl ClassClient {
         }
     }
 
-    // ── public API methods ────────────────────────────────────────────────────
-
-    /// Query all of a student's schedules for a given date (YYYYMMDD).
-    /// iclass status=2 means no data for that day; treated as an empty list.
-    /// Results are cached in memory for 24 hours per (student_id, date) pair.
-    pub async fn query_schedule(
-        &self,
-        student_id: &str,
-        date: &str,
-    ) -> AppResult<Vec<Schedule>> {
+    pub async fn query_schedule(&self, student_id: &str, date: &str) -> AppResult<Vec<Schedule>> {
         let key = (student_id.to_owned(), date.to_owned());
         if let Some(entry) = self.schedule_cache.get(&key) {
             let (stored_at, ref schedules) = *entry;
             if stored_at.elapsed() < SCHEDULE_CACHE_TTL {
-                debug!(student = student_id, date, "schedule cache hit");
+                debug!(student = %student_id, date, "schedule cache hit");
                 return Ok(schedules.clone());
             }
         }
-        let url = "https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action";
-        let result = match self.iclass_post(student_id, url, &[("dateStr", date)]).await {
+
+        let result = match self.iclass_post(student_id, SCHEDULE_URL, &[("dateStr", date)]).await {
             Ok(v) => v,
-            Err(e) if e.code == "remote_error" && e.message.starts_with("iclass status=2") => {
-                vec![]
-            }
+            Err(e) if e.code == "remote_error" && e.message.starts_with("iclass status=2") => vec![],
             Err(e) => return Err(e),
         };
         self.schedule_cache.insert(key, (Instant::now(), result.clone()));
         Ok(result)
     }
 
-    /// Query all course-level schedules (all sessions) for a course ID.
     pub async fn query_course_schedule(
         &self,
         student_id: &str,
         course_id: &str,
     ) -> AppResult<Vec<CourseSchedule>> {
-        let url =
-            "https://iclass.buaa.edu.cn:8347/app/my/get_my_course_sign_detail.action";
-        self.iclass_post(student_id, url, &[("courseId", course_id)])
+        self.iclass_post(student_id, COURSE_DETAIL_URL, &[("courseId", course_id)])
             .await
     }
 
-    /// Sign-in for `schedule_id` on behalf of `student_id`.
     pub async fn checkin(&self, student_id: &str, schedule_id: &str) -> AppResult<Value> {
-        // Get the server's accurate timestamp directly from iclass
-        let ts = self.get_server_timestamp().await?;
-        info!(student = student_id, "acquired server timestamp for checkin");
-        
-        // Perform checkin with the server timestamp
+        let ts = self.get_server_timestamp(student_id).await?;
         self.do_checkin_with_ts(student_id, schedule_id, &ts).await
     }
 
-    /// Get the server's accurate timestamp from iclass.
-    async fn get_server_timestamp(&self) -> AppResult<String> {
-        let url = "http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action";
-        let val: Value = self.http.get(url).send().await?.json().await?;
-        if let Some(ts_val) = val.get("timestamp") {
-            // Handle both string and numeric timestamp formats
-            let ts_str = if let Some(s) = ts_val.as_str() {
-                s.to_string()
-            } else if let Some(n) = ts_val.as_i64() {
-                n.to_string()
-            } else if let Some(n) = ts_val.as_u64() {
-                n.to_string()
-            } else {
-                return Err(AppError::remote("Failed to parse timestamp value from server"));
-            };
-            debug!(ts = &ts_str, "acquired server timestamp");
-            Ok(ts_str)
-        } else {
-            Err(AppError::remote("Failed to parse timestamp from server response"))
+    async fn get_server_timestamp(&self, student_id: &str) -> AppResult<String> {
+        let sess = self.ensure_session(student_id).await?;
+        let res = self
+            .http
+            .post(format!("{TIMESTAMP_URL}?id={}", sess.class_id))
+            .header("Sessionid", &sess.login_name)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        match res.get("STATUS").and_then(|v| v.as_str()) {
+            Some("0") => {}
+            Some("4001" | "401") => {
+                warn!(student_id = %student_id, "timestamp session expired, re-logging in");
+                self.clear_student_state(student_id);
+                let sess2 = self.ensure_session(student_id).await?;
+                let retry = self
+                    .http
+                    .post(format!("{TIMESTAMP_URL}?id={}", sess2.class_id))
+                    .header("Sessionid", &sess2.login_name)
+                    .send()
+                    .await?
+                    .json::<Value>()
+                    .await?;
+                return retry
+                    .get("timestamp")
+                    .map(timestamp_to_string)
+                    .transpose()?
+                    .ok_or_else(|| AppError::remote("Failed to parse timestamp from server response"));
+            }
+            Some(status) => {
+                return Err(AppError::remote(format!(
+                    "iclass status={} msg={:?}",
+                    status,
+                    res.get("ERRMSG").and_then(|v| v.as_str())
+                )));
+            }
+            None => return Err(AppError::remote("Failed to parse timestamp from server response")),
         }
+
+        res.get("timestamp")
+            .map(timestamp_to_string)
+            .transpose()?
+            .ok_or_else(|| AppError::remote("Failed to parse timestamp from server response"))
     }
 
-    /// Perform checkin with a given timestamp string.
     async fn do_checkin_with_ts(
         &self,
         student_id: &str,
         schedule_id: &str,
         ts: &str,
     ) -> AppResult<Value> {
-        let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
         let sess = self.ensure_session(student_id).await?;
-        let params = [
-            ("id", sess.user_id.as_str()),
-            ("courseSchedId", schedule_id),
-            ("timestamp", ts),
-        ];
+        let params = [("courseSchedId", schedule_id), ("timestamp", ts)];
         let res = self
             .http
-            .post(url)
-            .header("Sessionid", &sess.session_id)
-            .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
+            .post(format!("{CHECKIN_URL}?id={}", sess.class_id))
+            .header("Sessionid", &sess.login_name)
             .query(&params)
             .send()
             .await?
@@ -379,19 +449,13 @@ impl ClassClient {
         let result = match res {
             Ok(r) => {
                 if r.status == "4001" || r.status == "401" {
-                    warn!(student_id, "session expired, re-logging in");
-                    self.sessions.remove(student_id);
+                    warn!(student_id = %student_id, "session expired, re-logging in");
+                    self.clear_student_state(student_id);
                     let sess2 = self.ensure_session(student_id).await?;
-                    let retry_params = [
-                        ("id", sess2.user_id.as_str()),
-                        ("courseSchedId", schedule_id),
-                        ("timestamp", ts),
-                    ];
                     self.http
-                        .post(url)
-                        .header("Sessionid", &sess2.session_id)
-                        .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
-                        .query(&retry_params)
+                        .post(format!("{CHECKIN_URL}?id={}", sess2.class_id))
+                        .header("Sessionid", &sess2.login_name)
+                        .query(&params)
                         .send()
                         .await?
                         .json::<ClassRes<Value>>()
@@ -404,108 +468,86 @@ impl ClassClient {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(result)
-    }
-
-    /// Check if an error message suggests offset-related issues.
-    fn is_offset_error(&self, err: &AppError) -> bool {
-        let msg = &err.message;
-        msg.contains("参数错误") || msg.contains("二维码已失效") || msg.contains("已失效")
-    }
-
-    /// Binary search for a valid offset in the range [CHECKIN_OFFSET_MIN, CHECKIN_OFFSET_MAX].
-    async fn binary_search_offset(
-        &self,
-        student_id: &str,
-        schedule_id: &str,
-        base_ts: i64,
-    ) -> AppResult<(i64, Value)> {
-        // Deprecated: This method is no longer used. Use get_server_timestamp() and do_checkin_with_ts() instead.
-        Err(AppError::remote("binary search offset is deprecated"))
-    }
-
-    /// Deprecated: Perform a single checkin request with the given offset (kept for reference, no longer used).
-    #[allow(dead_code)]
-    async fn do_checkin(
-        &self,
-        student_id: &str,
-        schedule_id: &str,
-        offset: i64,
-        base_ts: i64,
-    ) -> AppResult<Value> {
-        let url = "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action";
-        let ts = (base_ts + offset).to_string();
-        let sess = self.ensure_session(student_id).await?;
-        let params = [
-            ("id", sess.user_id.as_str()),
-            ("courseSchedId", schedule_id),
-            ("timestamp", ts.as_str()),
-        ];
-        let res = self
-            .http
-            .post(url)
-            .header("Sessionid", &sess.session_id)
-            .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
-            .query(&params)
-            .send()
-            .await?
-            .json::<ClassRes<Value>>()
-            .await;
-
-        let result = match res {
-            Ok(r) => {
-                if r.status == "4001" || r.status == "401" {
-                    warn!(student_id, "session expired, re-logging in");
-                    self.sessions.remove(student_id);
-                    let sess2 = self.ensure_session(student_id).await?;
-                    let retry_params = [
-                        ("id", sess2.user_id.as_str()),
-                        ("courseSchedId", schedule_id),
-                        ("timestamp", ts.as_str()),
-                    ];
-                    self.http
-                        .post(url)
-                        .header("Sessionid", &sess2.session_id)
-                        .header(reqwest::header::USER_AGENT, CHECKIN_PY_LIKE_UA)
-                        .query(&retry_params)
-                        .send()
-                        .await?
-                        .json::<ClassRes<Value>>()
-                        .await?
-                        .take()?
-                } else {
-                    r.take()?
-                }
-            }
-            Err(e) => return Err(e.into()),
-        };
+        if result
+            .get("stuSignStatus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0")
+            != "1"
+        {
+            return Err(AppError::remote("Checkin failed"));
+        }
 
         Ok(result)
     }
 }
 
-#[cfg(test)]
-mod ua_tests {
-    use super::{mobile_user_agent, select_mobile_ua_from_pool, MOBILE_WECHAT_USER_AGENTS};
-
-    #[test]
-    fn ua_pool_is_not_empty() {
-        assert!(!MOBILE_WECHAT_USER_AGENTS.is_empty());
+fn timestamp_to_string(value: &Value) -> AppResult<String> {
+    if let Some(s) = value.as_str() {
+        return Ok(s.to_string());
     }
-
-    #[test]
-    fn ua_pool_covers_android_and_iphone() {
-        let has_android = MOBILE_WECHAT_USER_AGENTS.iter().any(|ua| ua.contains("Android"));
-        let has_iphone = MOBILE_WECHAT_USER_AGENTS.iter().any(|ua| ua.contains("iPhone"));
-        assert!(has_android, "UA pool should contain Android WeChat UA");
-        assert!(has_iphone, "UA pool should contain iPhone WeChat UA");
+    if let Some(n) = value.as_i64() {
+        return Ok(n.to_string());
     }
+    if let Some(n) = value.as_u64() {
+        return Ok(n.to_string());
+    }
+    Err(AppError::remote("Failed to parse timestamp value from server"))
+}
 
-    #[test]
-    fn empty_pool_returns_none_and_runtime_has_fallback() {
-        assert_eq!(select_mobile_ua_from_pool(&[]), None);
-        let ua = mobile_user_agent();
-        assert!(!ua.is_empty());
-        assert!(ua.contains("Mobile") || ua.contains("MicroMessenger"));
+fn extract_input_value(html: &str, name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let pos = html.find(&needle)?;
+    let tail = &html[pos..];
+    let value_pos = tail.find("value=\"")?;
+    let rest = &tail[value_pos + 7..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_login_name_from_url(url: &str) -> Option<String> {
+    for part in url.split(['?', '#', '&']) {
+        if let Some(value) = part.strip_prefix("loginName=") {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = from_hex(bytes[i + 1]);
+                let lo = from_hex(bytes[i + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }

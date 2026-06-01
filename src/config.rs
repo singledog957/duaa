@@ -14,6 +14,7 @@ pub struct Config {
 pub struct StudentEntry {
     pub student_id: String,
     pub name: String,
+    pub sso_password: String,
     pub course_ids: Vec<String>,
 }
 
@@ -32,6 +33,8 @@ struct RawConfig {
 struct RawStudentEntry {
     student_id: Option<String>,
     name: Option<String>,
+    sso_password: Option<String>,
+    password: Option<String>,
     course_ids: Option<Vec<String>>,
 }
 
@@ -76,11 +79,20 @@ impl Config {
                 warn!(student = %student_id, "skip student entry: empty course_ids");
                 continue;
             }
+            let Some(sso_password) = s.sso_password.or(s.password) else {
+                warn!(student = %student_id, "skip student entry: missing sso_password");
+                continue;
+            };
+            if sso_password.trim().is_empty() {
+                warn!(student = %student_id, "skip student entry: empty sso_password");
+                continue;
+            }
 
             let name = s.name.unwrap_or_else(|| student_id.clone());
             students.push(StudentEntry {
                 student_id,
                 name,
+                sso_password,
                 course_ids,
             });
         }

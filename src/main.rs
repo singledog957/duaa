@@ -81,7 +81,7 @@ async fn main() {
         "starting duaa"
     );
 
-    let client = Arc::new(client::ClassClient::new());
+    let client = Arc::new(client::ClassClient::new(&cfg.students));
     let cache = Arc::new(pipeline::SchedulerCache::new());
     let queue = Arc::new(pipeline::TaskQueue::new());
 
