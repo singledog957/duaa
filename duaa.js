@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         不智慧教室
-// @version      2.6
+// @version      2.7
 // @description  Bypass CORS to allow local in-campus query/checkin for the frontend
 // @author       singledog
 // @match        https://duaa.singledog233.top/*
