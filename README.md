@@ -33,10 +33,10 @@ date
   "log_file": "backend_pub.log",
   "students": [
     {
-      "student_id": "22373062",
+      "student_id": "22373000",
       "name": "张三",
       "sso_password": "your_sso_password",
-      "course_ids": ["91984", "91985"]
+      "course_ids": ["91999", "91998"]
     }
   ]
 }
