@@ -79,7 +79,7 @@ auto_login_iclass() {
       --data-urlencode "_eventId=ignoreAndContinue"
   fi
 
-  location="$(curl -ksS -A "$UA" -c "$cookie" -b "$cookie" -o /dev/null -D - "$JUMP_URL" | tr -d '\r' | awk '/^location: /{print $2}' | tail -n1)"
+  location="$(curl -kLsS --max-redirs 10 -A "$UA" -c "$cookie" -b "$cookie" -o /dev/null -D - "$JUMP_URL" | tr -d '\r' | awk 'tolower($1) == "location:" {print $2}')"
   login_name="$(printf '%s' "$location" | extract_login_name | head -n1)"
   login_name="$(percent_decode "$login_name")"
   if [[ -z "$login_name" ]]; then
