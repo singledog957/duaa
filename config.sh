@@ -124,6 +124,8 @@ query_day() {
 if [[ -z "$STUDENT_ID" ]]; then
   read -r -p "请输入学号: " STUDENT_ID
 fi
+need_cmd jq
+STUDENT_ID="$(jq -nr --arg id "$STUDENT_ID" '$id | gsub("^\\s+|\\s+$"; "") | ascii_downcase')"
 
 if [[ -z "$STUDENT_ID" ]]; then
   usage
@@ -138,7 +140,8 @@ read -r -s -p "请输入该学号的 SSO 密码（将写入 config.json 的 sso_
 echo
 
 echo "[1/5] 自动登录 SSO 并解析 iclass 身份"
-mapfile -t login_info < <(auto_login_iclass "$STUDENT_ID" "$SSO_PASSWORD")
+login_result="$(auto_login_iclass "$STUDENT_ID" "$SSO_PASSWORD")" || { echo "自动登录失败" >&2; exit 1; }
+mapfile -t login_info <<<"$login_result"
 if [[ "${#login_info[@]}" -lt 3 ]]; then
   echo "自动登录失败"
   exit 1
@@ -160,7 +163,7 @@ for i in 0 1 2 3 4 5 6; do
   printf '%s\n' "$day_resp" | jq -c '.result // []' >>"$tmp_arrays"
 done
 
-courses_json="$(jq -s '[.[][] | {course_id: .courseId, course_name: .courseName, week_day: .weekDay, begin: .classBeginTime}] | unique_by(.course_id)' "$tmp_arrays")"
+courses_json="$(jq -s '[.[][] | {course_id: (.courseId | tostring), course_name: .courseName, teacher: .teacherName, week_day: .weekDay, begin: .classBeginTime}] | unique_by(.course_id)' "$tmp_arrays")"
 rm -f "$tmp_arrays"
 
 count="$(printf '%s' "$courses_json" | jq 'length')"
@@ -170,13 +173,13 @@ if [[ "$count" -eq 0 ]]; then
 fi
 
 echo "[3/5] 选择课程"
-printf '%s' "$courses_json" | jq -r 'to_entries[] | "[\(.key + 1)] \(.value.course_name) (course_id: \(.value.course_id)) - \(.value.week_day) \(.value.begin)"'
+printf '%s' "$courses_json" | jq -r 'to_entries[] | "[\(.key + 1)] \(.value.course_name) \(.value.teacher // "") (course_id: \(.value.course_id)) - \(.value.week_day) \(.value.begin)"'
 
 declare -a picks=()
 while true; do
   read -r -p "Select indexes (e.g. '1 3') , or 'all' to select all courses: " input
   if [[ "$input" == "all" || "$input" == "*" ]]; then
-    selected_ids="$(printf '%s' "$courses_json" | jq '[.[].course_id] | unique')"
+    selected_ids="$(printf '%s' "$courses_json" | jq '[.[] | {course_id, name: .course_name} | tojson] | unique')"
     break
   fi
 
@@ -200,7 +203,7 @@ while true; do
     continue
   fi
 
-  selected_ids="$(printf '%s' "$courses_json" | jq --argjson idx "$idx_json" '[ $idx[] as $i | .[$i].course_id ] | unique')"
+  selected_ids="$(printf '%s' "$courses_json" | jq --argjson idx "$idx_json" '[ $idx[] as $i | .[$i] | {course_id, name: .course_name} | tojson ] | unique')"
   break
 done
 
@@ -214,7 +217,7 @@ if ! jq empty "$CONFIG_PATH" >/dev/null 2>&1; then
   exit 1
 fi
 
-exists="$(jq --arg sid "$STUDENT_ID" '[.students[]? | select(.student_id == $sid)] | length' "$CONFIG_PATH")"
+exists="$(jq --arg sid "$STUDENT_ID" '[.students[]? | select((.student_id | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == $sid)] | length' "$CONFIG_PATH")"
 if [[ "$exists" -gt 0 ]]; then
   read -r -p "Student $STUDENT_ID already exists. Overwrite? [y/N]: " yn
   case "$yn" in
@@ -232,8 +235,8 @@ jq \
   .poll_interval_minutes = (.poll_interval_minutes // 10)
   | .auto_window_minutes = (.auto_window_minutes // 15)
   | .students = (.students // [])
-  | if any(.students[]?; .student_id == $sid) then
-      .students = (.students | map(if .student_id == $sid then .name = $name | .sso_password = $sso_password | del(.password) | del(.login_name) | .course_ids = $selected else . end))
+  | if any(.students[]?; (.student_id | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == $sid) then
+      .students = (.students | map(if (.student_id | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == $sid then .student_id = $sid | .name = $name | .sso_password = $sso_password | del(.password) | del(.login_name) | .course_ids = $selected else . end))
     else
       .students += [{student_id: $sid, name: $name, sso_password: $sso_password, course_ids: $selected}]
     end

@@ -367,6 +367,11 @@ impl ClassClient {
         Ok(result)
     }
 
+    pub async fn refresh_schedule(&self, student_id: &str, date: &str) -> AppResult<Vec<Schedule>> {
+        self.schedule_cache.remove(&(student_id.to_owned(), date.to_owned()));
+        self.query_schedule(student_id, date).await
+    }
+
     pub async fn query_course_schedule(
         &self,
         student_id: &str,

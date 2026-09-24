@@ -4,8 +4,8 @@ use std::time::Duration;
 use rand::Rng;
 use tracing::{info, warn};
 
+use super::scheduler;
 use crate::AppState;
-
 
 /// Long-running task: consume queued tasks when they become due.
 pub async fn run(state: Arc<AppState>) {
@@ -34,7 +34,7 @@ pub async fn run(state: Arc<AppState>) {
 async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, course_id: &str) {
     // 2. Dynamic validation: fetch today's schedule and confirm sched is unsigned.
     let today = today_str();
-    let schedules = match state.client.query_schedule(student_id, &today).await {
+    let schedules = match state.client.refresh_schedule(student_id, &today).await {
         Ok(s) => s,
         Err(e) => {
             warn!(student = student_id, err = %e, "pre-checkin schedule fetch failed; skipping");
@@ -42,7 +42,7 @@ async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, cou
         }
     };
 
-    let target = schedules.iter().find(|s| s.course_id == course_id);
+    let target = schedules.iter().find(|s| s.id == schedule_id);
     match target {
         None => {
             info!(
@@ -62,13 +62,32 @@ async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, cou
             );
             return;
         }
+        Some(s)
+            if !state.cfg.students.iter().any(|entry| {
+                entry.student_id == student_id
+                    && (entry.auto_include_new_courses
+                        || scheduler::matches_manual_target(s, &schedules, &entry.course_ids))
+            }) =>
+        {
+            info!(
+                student = student_id,
+                sched = schedule_id,
+                "task skipped: no longer selected"
+            );
+            return;
+        }
         _ => {}
     }
 
     // 3. Execute check-in.
     match do_checkin(state, student_id, schedule_id).await {
         Ok(_) => {
-            info!(student = student_id, sched = schedule_id, course_id = course_id, "checkin ok");
+            info!(
+                student = student_id,
+                sched = schedule_id,
+                course_id = course_id,
+                "checkin ok"
+            );
         }
         Err(e) => {
             // One retry after random jitter (1-5 s).
@@ -83,9 +102,29 @@ async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, cou
             );
             tokio::time::sleep(Duration::from_secs(jitter)).await;
 
+            match state.client.refresh_schedule(student_id, &today).await {
+                Ok(current) => match current.iter().find(|s| s.id == schedule_id) {
+                    Some(s) if s.status() == 1 => {
+                        info!(student = student_id, sched = schedule_id, "checkin already confirmed after error");
+                        return;
+                    }
+                    None => {
+                        info!(student = student_id, sched = schedule_id, "task disappeared before retry");
+                        return;
+                    }
+                    _ => {}
+                },
+                Err(err) => warn!(student = student_id, sched = schedule_id, err = %err, "fresh schedule check before retry failed"),
+            }
+
             match do_checkin(state, student_id, schedule_id).await {
                 Ok(_) => {
-                    info!(student = student_id, sched = schedule_id, course_id = course_id, "checkin ok (retry)");
+                    info!(
+                        student = student_id,
+                        sched = schedule_id,
+                        course_id = course_id,
+                        "checkin ok (retry)"
+                    );
                 }
                 Err(e2) => {
                     warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e2, "checkin failed after retry");
@@ -108,10 +147,5 @@ fn today_str() -> String {
     use time::macros::offset;
     use time::OffsetDateTime;
     let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
-    format!(
-        "{:04}{:02}{:02}",
-        now.year(),
-        now.month() as u8,
-        now.day()
-    )
+    format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
 }

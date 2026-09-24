@@ -19,7 +19,7 @@ fn in_polling_window() -> bool {
 /// Long-running task: periodically fetches today's schedules for all registered students
 /// and enqueues auto-checkin tasks.
 pub async fn run(state: Arc<AppState>) {
-    let interval_secs = state.cfg.poll_interval_minutes * 60;
+    let interval_secs = state.cfg.poll_interval_minutes.max(1) * 60;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
 
     loop {
@@ -42,20 +42,31 @@ pub async fn poll_once(state: &AppState) {
         use time::macros::offset;
         use time::OffsetDateTime;
         let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
-        format!(
-            "{:04}{:02}{:02}",
-            now.year(),
-            now.month() as u8,
-            now.day()
-        )
+        format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
     };
 
     info!(date = %today, students = registrations.len(), "poller running");
 
     for (student_id, course_ids) in &registrations {
-        match state.client.query_schedule(student_id, &today).await {
+        if state
+            .cfg
+            .students
+            .iter()
+            .any(|s| s.student_id == *student_id && s.auto_include_new_courses)
+        {
+            continue;
+        }
+        match state.client.refresh_schedule(student_id, &today).await {
             Ok(schedules) => {
-                scheduler::plan_tasks(&state.queue, student_id, &schedules, course_ids).await;
+                scheduler::plan_tasks(
+                    &state.queue,
+                    student_id,
+                    &schedules,
+                    course_ids,
+                    state.cfg.auto_window_minutes,
+                    false,
+                )
+                .await;
             }
             Err(e) => {
                 warn!(student = %student_id, err = %e, "schedule fetch failed");

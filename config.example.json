@@ -8,17 +8,16 @@
             "name": "User One",
             "sso_password": "your_sso_password_1",
             "course_ids": [
-                "your_course_id_a",
-                "your_course_id_b"
-            ]
+                "{\"course_id\":\"your_course_id_a\",\"name\":\"Course A\"}"
+            ],
+            "auto_include_new_courses": false
         },
         {
             "student_id": "your_student_id_2",
             "name": "User Two",
             "sso_password": "your_sso_password_2",
-            "course_ids": [
-                "your_course_id_c"
-            ]
+            "course_ids": [],
+            "auto_include_new_courses": true
         }
     ]
 }

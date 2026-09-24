@@ -1,10 +1,11 @@
 pub mod poller;
 pub mod scheduler;
+pub mod weekly;
 pub mod worker;
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashMap},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +49,7 @@ impl SchedulerCache {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Task {
     pub run_at: u64,
+    pub class_start: u64,
     pub student_id: String,
     pub schedule_id: String,
     pub course_id: String,
@@ -70,7 +72,7 @@ impl PartialOrd for Task {
 
 pub struct TaskQueue {
     heap: Mutex<BinaryHeap<Task>>,
-    seen: Mutex<HashSet<(String, String)>>,
+    seen: Mutex<HashMap<(String, String), u64>>,
     notify: Notify,
 }
 
@@ -78,19 +80,20 @@ impl TaskQueue {
     pub fn new() -> Self {
         Self {
             heap: Mutex::new(BinaryHeap::new()),
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(HashMap::new()),
             notify: Notify::new(),
         }
     }
 
-    /// Enqueue task; silently skips if (student_id, schedule_id) already present.
+    /// Enqueue task once per process, including tasks already executed.
     pub async fn push(&self, task: Task) {
         let key = (task.student_id.clone(), task.schedule_id.clone());
         let mut seen = self.seen.lock().await;
-        if seen.contains(&key) {
+        seen.retain(|_, expires| *expires > now_secs());
+        if seen.contains_key(&key) {
             return;
         }
-        seen.insert(key);
+        seen.insert(key, task.class_start.saturating_add(3600));
         drop(seen);
         self.heap.lock().await.push(task);
         self.notify.notify_one();
@@ -102,8 +105,6 @@ impl TaskQueue {
         let mut heap = self.heap.lock().await;
         if heap.peek().map(|t| t.run_at <= now).unwrap_or(false) {
             let task = heap.pop().unwrap();
-            let mut seen = self.seen.lock().await;
-            seen.remove(&(task.student_id.clone(), task.schedule_id.clone()));
             return Some(task);
         }
         None
@@ -132,4 +133,26 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_task_is_not_queued_again() {
+        let queue = TaskQueue::new();
+        let now = now_secs();
+        let task = Task {
+            run_at: now,
+            class_start: now + 120,
+            student_id: "abc".into(),
+            schedule_id: "s1".into(),
+            course_id: "c1".into(),
+        };
+        queue.push(task.clone()).await;
+        assert!(queue.pop_ready().await.is_some());
+        queue.push(task).await;
+        assert!(queue.pop_ready().await.is_none());
+    }
 }

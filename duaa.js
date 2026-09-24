@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         不智慧教室
-// @version      2.7.2
+// @version      2.8.0
 // @description  Bypass CORS to allow local in-campus query/checkin for the frontend
 // @author       singledog
 // @match        https://duaa.singledog233.top/*
@@ -26,6 +26,7 @@
     const LOGIN_BASE = 'https://iclass.buaa.edu.cn:8346'
     const BASE = 'https://iclass.buaa.edu.cn:8347'
     const SIGN_BASE = 'http://iclass.buaa.edu.cn:8081'
+    const canonicalId = (sid) => String(sid).trim().toLowerCase()
 
     // ── GM_xmlhttpRequest 的 Promise 封装 ────────────────────────────────────────
     function gmReq(details) {
@@ -71,23 +72,49 @@
     }
 
     async function getServerTimestamp(studentId) {
-        const tk = await ensureToken(studentId)
-        const res = await gmReq({
-            method: 'POST',
-            url: `${SIGN_BASE}/app/common/get_timestamp.action?id=${encodeURIComponent(tk.classId)}`,
-            headers: { Sessionid: tk.loginName },
-        })
-        const j = JSON.parse(res.responseText)
-        if (j.STATUS && j.STATUS !== '0') throw new Error(j.ERRMSG || `iclass STATUS=${j.STATUS}`)
+        async function request(tk) {
+            const res = await gmReq({
+                method: 'POST',
+                url: `${SIGN_BASE}/app/common/get_timestamp.action?id=${encodeURIComponent(tk.classId)}`,
+                headers: { Sessionid: tk.loginName },
+            })
+            return JSON.parse(res.responseText)
+        }
+        let j = await request(await ensureToken(studentId))
+        if (j.STATUS === '4001' || j.STATUS === '401') {
+            await clearToken(studentId)
+            j = await request(await login(studentId))
+        }
+        if (j.STATUS !== '0') throw new Error(j.ERRMSG || `iclass STATUS=${j.STATUS}`)
         const ts = j && j.timestamp
         if (ts === undefined || ts === null) throw new Error('timestamp missing')
         return String(ts)
     }
 
+    function endpointResponds(url) {
+        return new Promise((resolve) => GM_xmlhttpRequest({
+            method: 'GET', url, timeout: 5000,
+            onload: (r) => resolve(r.status > 0),
+            onerror: () => resolve(false),
+            ontimeout: () => resolve(false),
+        }))
+    }
+
+    async function probeAvailability() {
+        const [query, sign] = await Promise.all([
+            endpointResponds(`${BASE}/`), endpointResponds(`${SIGN_BASE}/`),
+        ])
+        return query && sign
+    }
+
     function matchSchedule(sched, targets) {
-        const idMatch = targets.includes(sched.course_id) || targets.includes(sched.id)
-        if (idMatch) return true
-        return targets.includes(sched.name)
+        return targets.some((entry) => {
+            if (entry === sched.course_id || entry === sched.id || entry === sched.name) return true
+            try {
+                const target = JSON.parse(entry)
+                return target.course_id === sched.course_id || target.name === sched.name
+            } catch { return false }
+        })
     }
 
     // ── 令牌缓存（以学号为 key） ──────────────────────────────────────────────────
@@ -178,14 +205,14 @@
 
         const items = Array.isArray(raw) ? raw : (raw === null ? [] : [raw])
         const schedules = items.map((s) => ({
-            id: s.id,
-            course_id: s.courseId,
-            name: s.courseName,
-            teacher: s.teacherName,
+            id: String(s.id),
+            course_id: String(s.courseId ?? ''),
+            name: s.courseName || '',
+            teacher: s.teacherName || '',
             classroom_name: s.classroomName || '',
             time: toIso(s.classBeginTime),
             end_time: toIso(s.classEndTime),
-            status: s.signStatus === '1' ? 1 : 0,
+            status: String(s.signStatus) === '1' ? 1 : 0,
         }))
 
         const cached = await loadToken(studentId)
@@ -198,17 +225,19 @@
     // ── Bridge：手动签到 ──────────────────────────────────────────────────────────
     async function checkin(studentId, scheduleId) {
         const ts = await getServerTimestamp(studentId)
-        await iclassRequest(
+        const result = await iclassRequest(
             studentId,
             `${SIGN_BASE}/eschool/app/course/stu_scan_sign.action`,
             { courseSchedId: scheduleId, timestamp: ts },
         )
+        if (String(result?.stuSignStatus) !== '1') throw new Error('签到失败：未确认签到状态')
     }
 
     // Serialize storage and network operations: the website does not await saveLoginName.
     let queue = Promise.resolve()
     function enqueue(method, args) {
-        const result = queue.then(() => ({ querySchedule, checkin, saveLoginName })[method](...args))
+        const normalized = method === 'probeAvailability' ? [] : [canonicalId(args[0]), ...args.slice(1)]
+        const result = queue.then(() => ({ querySchedule, checkin, saveLoginName, probeAvailability })[method](...normalized))
         queue = result.catch(() => {})
         return result
     }
@@ -216,6 +245,7 @@
         querySchedule: (...args) => enqueue('querySchedule', args),
         checkin: (...args) => enqueue('checkin', args),
         matchSchedule,
+        probeAvailability,
         saveLoginName: (...args) => {
             const result = enqueue('saveLoginName', args)
             result.catch(e => console.error('[不智慧教室] 保存登录信息失败', e))
@@ -243,8 +273,8 @@
             return
         }
         if (m.type !== 'request' || typeof m.id !== 'string' ||
-            !['querySchedule', 'checkin', 'saveLoginName'].includes(m.method) ||
-            !Array.isArray(m.args) || m.args.length !== 2 ||
+            !['querySchedule', 'checkin', 'saveLoginName', 'probeAvailability'].includes(m.method) ||
+            !Array.isArray(m.args) || m.args.length !== (m.method === 'probeAvailability' ? 0 : 2) ||
             !m.args.every(a => typeof a === 'string' || typeof a === 'number')) return
         enqueue(m.method, m.args).then(
             result => window.postMessage({ channel, type: 'response', id: m.id, result }, origin),
@@ -285,8 +315,14 @@
         window.__checkinBridge = {
             querySchedule: (...args) => call('querySchedule', args),
             checkin: (...args) => call('checkin', args),
-            matchSchedule: (sched, targets) =>
-                targets.includes(sched.course_id) || targets.includes(sched.id) || targets.includes(sched.name),
+            matchSchedule: (sched, targets) => targets.some((entry) => {
+                if (entry === sched.course_id || entry === sched.id || entry === sched.name) return true
+                try {
+                    const target = JSON.parse(entry)
+                    return target.course_id === sched.course_id || target.name === sched.name
+                } catch { return false }
+            }),
+            probeAvailability: () => call('probeAvailability', []),
             saveLoginName: (sid, name) => {
                 const result = call('saveLoginName', [sid, name || ''])
                 result.catch(e => console.error('[不智慧教室] 保存登录信息失败', e))

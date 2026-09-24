@@ -22,6 +22,8 @@ date
 - `sso_password`
 - `course_ids`
 
+如需托管所有课程（包括每周新增课程），将该学生的 `auto_include_new_courses` 设为 `true`，此时 `course_ids` 可以为空。
+
 ## 配置格式
 
 `config.json` 示例：
@@ -36,7 +38,8 @@ date
       "student_id": "22373000",
       "name": "张三",
       "sso_password": "your_sso_password",
-      "course_ids": ["91999", "91998"]
+      "course_ids": ["{\"course_id\":\"91999\",\"name\":\"高等数学\"}"],
+      "auto_include_new_courses": false
     }
   ]
 }
@@ -47,7 +50,8 @@ date
 - `student_id`：学号
 - `name`：备注名或姓名
 - `sso_password`：统一认证密码
-- `course_ids`：需要自动签到的课程 ID 列表
+- `course_ids`：手动选择的课程目标；支持课程 ID、课程名，以及包含 `course_id` 和 `name` 的 JSON 字符串。选中一门课时，同名的其他老师课程也会签到
+- `auto_include_new_courses`：设为 `true` 时托管全部课程，Rust 版会在每周日 20:00 后规划下周课表；cron 版需执行 `--weekly`
 - `poll_interval_minutes`：轮询课表间隔
 - `auto_window_minutes`：自动签到时间窗口参数
 - `log_file`：日志文件路径
@@ -87,18 +91,21 @@ chmod +x easy_sign.sh
 ./easy_sign.sh --query
 ```
 
-建议将其加入 `crontab`，例如每天早上 7 点执行一次课表查询：
+建议将其加入 `crontab`，每天早上查询当天课表，并在周日晚上规划下周课程：
 
 ```cron
 0 7 * * * /path/to/backend_pub/easy_sign.sh --query
+0 20 * * 0 /path/to/backend_pub/easy_sign.sh --weekly
 ```
 
 执行流程：
 
-1. `--query` 查询当天课表
+1. `--query` 查询当天课表；`--weekly` 为全课程托管用户查询未来 7 天
 2. 自动为待签到课程生成签到任务
 3. 将任务写入 `cron`
-4. 在课前自动执行签到
+4. 在课前重新查询课表，确认准确课次仍存在且尚未签到，然后执行签到
+
+`install.sh --mode fast` 会配置以上两条 cron。手动设置时建议传入绝对路径的 `--config` 和 `--state-dir`。cron 所在机器的时区应设为北京时间。
 
 如需手动触发签到，也可以使用：
 
@@ -123,6 +130,11 @@ cargo build --release
 ```
 
 如不传 `--config`，默认读取当前目录下的 `config.json`。
+Rust 版启动时规划本周剩余日期，每周日 20:00 后刷新下周课表；手动选择课程仍按轮询间隔刷新当天课表。学号会去除首尾空格并统一转为小写。
+
+## 浏览器脚本
+
+`duaa.js` 与主站 `frontend/public/checkin.user.js` 同步，提供当前前端所需的 `querySchedule`、`checkin`、`probeAvailability` 和 `saveLoginName` 桥接接口。浏览器本地签到使用服务端时间戳，并按小写学号缓存会话。
 
 ## 旧配置迁移
 

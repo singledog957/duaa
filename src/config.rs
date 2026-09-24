@@ -16,6 +16,7 @@ pub struct StudentEntry {
     pub name: String,
     pub sso_password: String,
     pub course_ids: Vec<String>,
+    pub auto_include_new_courses: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +37,8 @@ struct RawStudentEntry {
     sso_password: Option<String>,
     password: Option<String>,
     course_ids: Option<Vec<String>>,
+    #[serde(default)]
+    auto_include_new_courses: bool,
 }
 
 fn default_poll() -> u64 {
@@ -66,25 +69,28 @@ impl Config {
         };
 
         let mut students = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
         for (idx, s) in raw_cfg.students.into_iter().enumerate() {
             let Some(student_id) = s.student_id else {
                 warn!(index = idx, "skip student entry: missing student_id");
                 continue;
             };
-            let Some(course_ids) = s.course_ids else {
-                warn!(student = %student_id, "skip student entry: missing course_ids");
-                continue;
-            };
-            if course_ids.is_empty() {
+            let course_ids = s.course_ids.unwrap_or_default();
+            if course_ids.is_empty() && !s.auto_include_new_courses {
                 warn!(student = %student_id, "skip student entry: empty course_ids");
                 continue;
             }
+            let student_id = student_id.trim().to_ascii_lowercase();
             let Some(sso_password) = s.sso_password.or(s.password) else {
                 warn!(student = %student_id, "skip student entry: missing sso_password");
                 continue;
             };
             if sso_password.trim().is_empty() {
                 warn!(student = %student_id, "skip student entry: empty sso_password");
+                continue;
+            }
+            if student_id.is_empty() || !seen_ids.insert(student_id.clone()) {
+                warn!(student = %student_id, "skip student entry: empty or duplicate student_id");
                 continue;
             }
 
@@ -94,6 +100,7 @@ impl Config {
                 name,
                 sso_password,
                 course_ids,
+                auto_include_new_courses: s.auto_include_new_courses,
             });
         }
 

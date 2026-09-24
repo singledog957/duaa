@@ -102,6 +102,11 @@ async fn main() {
         pipeline::poller::run(poller_state).await;
     });
 
+    let weekly_state = state.clone();
+    tokio::spawn(async move {
+        pipeline::weekly::run(weekly_state).await;
+    });
+
     let worker_state = state.clone();
     tokio::spawn(async move {
         pipeline::worker::run(worker_state).await;
