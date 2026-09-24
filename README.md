@@ -134,7 +134,7 @@ Rust 版启动时规划本周剩余日期，每周日 20:00 后刷新下周课�
 
 ## 浏览器脚本
 
-`duaa.js` 与主站 `frontend/public/checkin.user.js` 同步，提供当前前端所需的 `querySchedule`、`checkin`、`probeAvailability` 和 `saveLoginName` 桥接接口。浏览器本地签到使用服务端时间戳，并按小写学号缓存会话。
+`duaa.js`是校内签到所需脚本。
 
 ## 旧配置迁移
 
