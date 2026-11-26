@@ -1,0 +1,10 @@
+.git
+target
+logs
+config.json
+config.*.json
+deploy/accounts
+deploy/dashboard
+*.log
+*.png
+*.deb

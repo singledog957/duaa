@@ -1,11 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::Rng;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::AppState;
 
+use super::{scheduler::parse_class_time, CHECKIN_RETRY_INTERVAL_SECS, POST_CLASS_WINDOW_SECS};
+
+/// Fallback cap when the schedule carries no end time.
+const MAX_ATTEMPTS_WITHOUT_END: u32 = 20;
+/// Errors that no amount of retrying can fix — bail out immediately.
+const FATAL_CHECKIN_ERRORS: &[&str] = &["非本节课学生", "用户不存在"];
 
 /// Long-running task: consume queued tasks when they become due.
 pub async fn run(state: Arc<AppState>) {
@@ -14,7 +19,15 @@ pub async fn run(state: Arc<AppState>) {
         while let Some(task) = state.queue.pop_ready().await {
             let s = state.clone();
             tokio::spawn(async move {
-                execute_task(&s, &task.student_id, &task.schedule_id, &task.course_id).await;
+                execute_task(
+                    &s,
+                    &task.student_id,
+                    &task.schedule_id,
+                    &task.course_id,
+                    &task.group,
+                )
+                .await;
+                s.queue.finish(&task.student_id, &task.schedule_id).await;
             });
         }
 
@@ -31,10 +44,26 @@ pub async fn run(state: Arc<AppState>) {
 }
 
 /// Execute one check-in task with dynamic validation and one retry on transient failure.
-async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, course_id: &str) {
+async fn execute_task(
+    state: &AppState,
+    student_id: &str,
+    schedule_id: &str,
+    course_id: &str,
+    group: &[String],
+) {
+    // Re-check the student is still configured; hot-reload may have removed them.
+    let Some(filter) = state.cache.get(student_id) else {
+        info!(
+            student = student_id,
+            sched = schedule_id,
+            "task skipped: student no longer in config"
+        );
+        return;
+    };
+
     // 2. Dynamic validation: fetch today's schedule and confirm sched is unsigned.
     let today = today_str();
-    let schedules = match state.client.query_schedule(student_id, &today).await {
+    let schedules = match state.client.query_schedule_force(student_id, &today).await {
         Ok(s) => s,
         Err(e) => {
             warn!(student = student_id, err = %e, "pre-checkin schedule fetch failed; skipping");
@@ -62,56 +91,160 @@ async fn execute_task(state: &AppState, student_id: &str, schedule_id: &str, cou
             );
             return;
         }
+        // Hot-reload may have excluded this course after the task was enqueued.
+        Some(s) if !filter.matches(&s.course_id, &s.id, &s.name) => {
+            info!(
+                student = student_id,
+                sched = schedule_id,
+                course = %s.name,
+                "task skipped: filtered out by current config"
+            );
+            return;
+        }
         _ => {}
     }
 
-    // 3. Execute check-in.
-    match do_checkin(state, student_id, schedule_id).await {
-        Ok(_) => {
-            info!(student = student_id, sched = schedule_id, course_id = course_id, "checkin ok");
-        }
-        Err(e) => {
-            // One retry after random jitter (1-5 s).
-            let jitter: u64 = rand::rng().random_range(1..=5);
-            warn!(
+    // 3. Keep the signed 8081 path alive from the pre-class window through
+    //    10 minutes after class; only then use the 8082 fallback.
+    let end_unix = schedules
+        .iter()
+        .find(|s| s.course_id == course_id)
+        .and_then(|s| s.end_time.as_deref())
+        .and_then(parse_class_time);
+    match run_checkin_with_retries(state, student_id, schedule_id, course_id, group, end_unix).await
+    {
+        Ok(attempts) => {
+            info!(
                 student = student_id,
                 sched = schedule_id,
                 course_id = course_id,
-                err = %e,
-                retry_secs = jitter,
-                "checkin failed; retrying"
+                attempts,
+                "checkin ok"
             );
-            tokio::time::sleep(Duration::from_secs(jitter)).await;
-
-            match do_checkin(state, student_id, schedule_id).await {
-                Ok(_) => {
-                    info!(student = student_id, sched = schedule_id, course_id = course_id, "checkin ok (retry)");
-                }
-                Err(e2) => {
-                    warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e2, "checkin failed after retry");
-                }
-            }
+        }
+        Err(e) => {
+            warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, "checkin failed; giving up");
         }
     }
 }
 
-async fn do_checkin(
+/// Keep attempting the signed 8081 path every
+/// [`CHECKIN_RETRY_INTERVAL_SECS`] until it succeeds, the class ends
+/// (+[`POST_CLASS_WINDOW_SECS`]), or a permanently fatal error surfaces.
+/// Once that window is over, try the unsigned 8082 path exactly once.
+async fn run_checkin_with_retries(
+    state: &AppState,
+    student_id: &str,
+    schedule_id: &str,
+    course_id: &str,
+    group: &[String],
+    end_unix: Option<u64>,
+) -> crate::error::AppResult<u32> {
+    let hard_end = end_unix.map(|e| e + POST_CLASS_WINDOW_SECS);
+    let mut attempt: u32 = 1;
+    if state.client.has_secret_provider(student_id) {
+        loop {
+            match do_signed_checkin(state, student_id, schedule_id, group).await {
+                Ok(()) => return Ok(attempt),
+                Err(e) => {
+                    // Parallel-section groups share sign status; a member may have
+                    // been signed by an earlier round, another device, or manually.
+                    if group_signed(state, student_id, group).await {
+                        info!(
+                            student = student_id,
+                            sched = schedule_id,
+                            attempts = attempt,
+                            "checkin ok (group already signed)"
+                        );
+                        return Ok(attempt);
+                    }
+                    if FATAL_CHECKIN_ERRORS.iter().any(|s| e.message.contains(s)) {
+                        warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, "checkin failed permanently; giving up");
+                        return Err(e);
+                    }
+                    let now = super::now_secs();
+                    let over = match hard_end {
+                        Some(h) => now + CHECKIN_RETRY_INTERVAL_SECS >= h,
+                        None => attempt >= MAX_ATTEMPTS_WITHOUT_END,
+                    };
+                    if over {
+                        warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, attempts = attempt, "8081 window over; falling back to 8082");
+                        break;
+                    }
+                    if attempt == 1 {
+                        warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, retry_secs = CHECKIN_RETRY_INTERVAL_SECS, "8081 checkin failed; retrying during class");
+                    } else {
+                        debug!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, attempt, "8081 checkin retry failed");
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(CHECKIN_RETRY_INTERVAL_SECS)).await;
+                }
+            }
+        }
+    } else {
+        info!(
+            student = student_id,
+            sched = schedule_id,
+            course_id = course_id,
+            "no 8081 secret provider; using 8082 fallback"
+        );
+    }
+
+    do_fallback_checkin(state, student_id, schedule_id, group).await?;
+    Ok(attempt)
+}
+
+async fn do_signed_checkin(
     state: &AppState,
     student_id: &str,
     course_sched_id: &str,
+    group: &[String],
 ) -> crate::error::AppResult<()> {
-    state.client.checkin(student_id, course_sched_id).await?;
+    if group.is_empty() {
+        state
+            .client
+            .checkin_signed(student_id, &[course_sched_id.to_owned()])
+            .await?;
+    } else {
+        state.client.checkin_signed(student_id, group).await?;
+    }
     Ok(())
+}
+
+async fn do_fallback_checkin(
+    state: &AppState,
+    student_id: &str,
+    course_sched_id: &str,
+    group: &[String],
+) -> crate::error::AppResult<()> {
+    if group.is_empty() {
+        state
+            .client
+            .checkin_fallback(student_id, &[course_sched_id.to_owned()])
+            .await?;
+    } else {
+        state.client.checkin_fallback(student_id, group).await?;
+    }
+    Ok(())
+}
+
+/// Force-refresh today's schedule and report whether any group member is signed.
+async fn group_signed(state: &AppState, student_id: &str, group: &[String]) -> bool {
+    if group.is_empty() {
+        return false;
+    }
+    let today = today_str();
+    match state.client.query_schedule_force(student_id, &today).await {
+        Ok(scheds) => scheds
+            .iter()
+            .any(|s| group.contains(&s.id) && s.status() == 1),
+        Err(_) => false,
+    }
 }
 
 fn today_str() -> String {
     use time::macros::offset;
     use time::OffsetDateTime;
     let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
-    format!(
-        "{:04}{:02}{:02}",
-        now.year(),
-        now.month() as u8,
-        now.day()
-    )
+    format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
 }

@@ -1,5 +1,12 @@
 target/
 state/
 config.json
+config.*.json
+!config.example.json
 *.log
-test*
+logs/
+deploy/accounts/instances/
+deploy/accounts/*.deb
+__pycache__/
+*.pyc
+.env

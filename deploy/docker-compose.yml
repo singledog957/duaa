@@ -1,0 +1,38 @@
+name: duaa
+
+services:
+  duaa:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: duaa:latest
+    container_name: duaa
+    working_dir: /app
+    command: ["--config", "${DUAA_CONFIG:-config.json}"]
+    network_mode: host
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+
+  dashboard:
+    profiles: ["dashboard"]
+    build:
+      context: ./dashboard
+    image: duaa-dashboard:latest
+    container_name: duaa-dashboard
+    working_dir: /app
+    command: ["python3", "deploy/dashboard/server.py"]
+    network_mode: host
+    environment:
+      DASHBOARD_BIND: ${DASHBOARD_BIND:-0.0.0.0}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-9080}
+      DASHBOARD_TTL_MINUTES: ${DASHBOARD_TTL_MINUTES:-20}
+      DASHBOARD_DUAA_CONFIG: /app/${DUAA_CONFIG:-config.json}
+      HOST_PROC: /host/proc
+      HOST_SYS: /host/sys
+    volumes:
+      - ..:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    restart: "no"

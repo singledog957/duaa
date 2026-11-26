@@ -15,7 +15,12 @@ pub struct StudentEntry {
     pub student_id: String,
     pub name: String,
     pub sso_password: String,
+    /// Optional per-account secret-provider URL (wwlocal container).
+    /// When set, checkin signs via the official 8081 entry; on provider
+    /// failure it falls back to the legacy 8082 path.
+    pub secret_url: Option<String>,
     pub course_ids: Vec<String>,
+    pub exclude_courses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,7 +40,10 @@ struct RawStudentEntry {
     name: Option<String>,
     sso_password: Option<String>,
     password: Option<String>,
+    secret_url: Option<String>,
     course_ids: Option<Vec<String>>,
+    #[serde(default)]
+    exclude_courses: Option<Vec<String>>,
 }
 
 fn default_poll() -> u64 {
@@ -48,22 +56,24 @@ fn default_window() -> u64 {
 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Self {
-        let path_ref = path.as_ref();
-        let raw_text = match std::fs::read_to_string(path_ref) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("config read error at {}: {e}", path_ref.display());
-                std::process::exit(1);
-            }
-        };
-
-        let raw_cfg: RawConfig = match serde_json::from_str(&raw_text) {
+        match Self::try_load(path) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("config parse error at {}: {e}", path_ref.display());
+                eprintln!("{e}");
                 std::process::exit(1);
             }
-        };
+        }
+    }
+
+    /// Non-fatal variant used by the hot-reload path: returns Err instead of exiting,
+    /// so a broken config.json keeps the previous runtime state alive.
+    pub fn try_load<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let path_ref = path.as_ref();
+        let raw_text = std::fs::read_to_string(path_ref)
+            .map_err(|e| format!("config read error at {}: {e}", path_ref.display()))?;
+
+        let raw_cfg: RawConfig = serde_json::from_str(&raw_text)
+            .map_err(|e| format!("config parse error at {}: {e}", path_ref.display()))?;
 
         let mut students = Vec::new();
         for (idx, s) in raw_cfg.students.into_iter().enumerate() {
@@ -93,15 +103,17 @@ impl Config {
                 student_id,
                 name,
                 sso_password,
+                secret_url: s.secret_url,
                 course_ids,
+                exclude_courses: s.exclude_courses.unwrap_or_default(),
             });
         }
 
-        Config {
+        Ok(Config {
             poll_interval_minutes: raw_cfg.poll_interval_minutes,
             auto_window_minutes: raw_cfg.auto_window_minutes,
             log_file: raw_cfg.log_file,
             students,
-        }
+        })
     }
 }

@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info, warn};
 
@@ -21,15 +22,72 @@ fn in_polling_window() -> bool {
 pub async fn run(state: Arc<AppState>) {
     let interval_secs = state.cfg.poll_interval_minutes * 60;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut last_mtime: Option<SystemTime> = None;
 
     loop {
         ticker.tick().await;
+        reload_config(&state, &mut last_mtime);
         if !in_polling_window() {
             debug!("outside polling window (07:30-22:30), skipping");
             continue;
         }
         poll_once(&state).await;
     }
+}
+
+/// Hot-reload config.json when its mtime changes; keep the previous config on errors.
+fn reload_config(state: &AppState, last_mtime: &mut Option<SystemTime>) {
+    let mtime = match std::fs::metadata(&state.config_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(path = %state.config_path, err = %e, "config stat failed, skipping reload");
+            return;
+        }
+    };
+    if *last_mtime == Some(mtime) {
+        return;
+    }
+
+    match crate::config::Config::try_load(&state.config_path) {
+        Ok(cfg) => {
+            apply_students(state, &cfg.students);
+            // Only remember the mtime of a config we actually applied; a broken
+            // file keeps last_mtime stale so the next tick retries it.
+            *last_mtime = Some(mtime);
+            info!(path = %state.config_path, students = cfg.students.len(), "config reloaded");
+        }
+        Err(e) => {
+            warn!(err = %e, "config reload failed, keeping previous config");
+        }
+    }
+}
+
+/// Sync the runtime student state (filters + accounts) with a freshly loaded config.
+/// Students no longer present are removed together with their cached sessions.
+fn apply_students(state: &AppState, students: &[crate::config::StudentEntry]) {
+    let mut new_ids = HashSet::new();
+    for entry in students {
+        new_ids.insert(entry.student_id.clone());
+        state.cache.set(
+            entry.student_id.clone(),
+            scheduler::CourseFilter::from(entry),
+        );
+    }
+
+    let gone: Vec<String> = state
+        .cache
+        .snapshot()
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| !new_ids.contains(id))
+        .collect();
+    for id in gone {
+        state.cache.remove(&id);
+        state.client.remove_student(&id);
+        info!(student = %id, "student removed from config, cleared runtime state");
+    }
+
+    state.client.sync_accounts(students);
 }
 
 pub async fn poll_once(state: &AppState) {
@@ -42,20 +100,18 @@ pub async fn poll_once(state: &AppState) {
         use time::macros::offset;
         use time::OffsetDateTime;
         let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
-        format!(
-            "{:04}{:02}{:02}",
-            now.year(),
-            now.month() as u8,
-            now.day()
-        )
+        format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
     };
 
     info!(date = %today, students = registrations.len(), "poller running");
 
-    for (student_id, course_ids) in &registrations {
-        match state.client.query_schedule(student_id, &today).await {
+    for (student_id, filter) in &registrations {
+        match state.client.query_schedule_force(student_id, &today).await {
             Ok(schedules) => {
-                scheduler::plan_tasks(&state.queue, student_id, &schedules, course_ids).await;
+                if schedules.is_empty() {
+                    debug!(student = %student_id, date = %today, "today's schedule is empty");
+                }
+                scheduler::plan_tasks(&state.queue, student_id, &schedules, filter).await;
             }
             Err(e) => {
                 warn!(student = %student_id, err = %e, "schedule fetch failed");
