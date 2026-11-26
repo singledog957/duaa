@@ -5,6 +5,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        CARGO_MIRROR: ${CARGO_MIRROR:-}
     image: duaa:latest
     container_name: duaa
     working_dir: /app

@@ -57,6 +57,7 @@ def public_config(path=None):
                 "secret_url": secret_url,
                 "course_ids": student.get("course_ids", []),
                 "exclude_courses": student.get("exclude_courses", []),
+                "auto_include_new_courses": bool(student.get("auto_include_new_courses", False)),
             }
         )
     return {
@@ -106,6 +107,11 @@ def validate_config(payload, current_path=None):
         for item in current.get("students", [])
         if isinstance(item, dict)
     }
+    current_auto_include = {
+        item.get("student_id"): bool(item.get("auto_include_new_courses", False))
+        for item in current.get("students", [])
+        if isinstance(item, dict)
+    }
 
     seen = set()
     cleaned_students = []
@@ -140,6 +146,13 @@ def validate_config(payload, current_path=None):
         }
         if secret_url:
             entry["secret_url"] = secret_url
+        auto_include = (
+            bool(student.get("auto_include_new_courses"))
+            if "auto_include_new_courses" in student
+            else current_auto_include.get(student_id, False)
+        )
+        if auto_include:
+            entry["auto_include_new_courses"] = True
         cleaned_students.append(entry)
 
     return {
