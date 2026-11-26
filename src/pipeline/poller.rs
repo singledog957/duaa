@@ -20,7 +20,7 @@ fn in_polling_window() -> bool {
 /// Long-running task: periodically fetches today's schedules for all registered students
 /// and enqueues auto-checkin tasks.
 pub async fn run(state: Arc<AppState>) {
-    let interval_secs = state.cfg.poll_interval_minutes * 60;
+    let interval_secs = state.cfg.poll_interval_minutes.max(1) * 60;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     let mut last_mtime: Option<SystemTime> = None;
 
@@ -106,7 +106,7 @@ pub async fn poll_once(state: &AppState) {
     info!(date = %today, students = registrations.len(), "poller running");
 
     for (student_id, filter) in &registrations {
-        match state.client.query_schedule_force(student_id, &today).await {
+        match state.client.refresh_schedule(student_id, &today).await {
             Ok(schedules) => {
                 if schedules.is_empty() {
                     debug!(student = %student_id, date = %today, "today's schedule is empty");

@@ -1,17 +1,27 @@
 use std::collections::{HashMap, HashSet};
 
+use rand::Rng;
+use serde::Deserialize;
 use tracing::debug;
 
 use super::{now_secs, Task, TaskQueue, POST_CLASS_WINDOW_SECS, PRE_CLASS_WINDOW_SECS};
 
+#[derive(Deserialize)]
+struct PersistedCourseTarget {
+    course_id: Option<String>,
+    name: Option<String>,
+}
+
 /// Include/exclude course matching policy for one student.
 ///
-/// `include` entries match by course id, schedule id, or exact course name;
-/// the wildcard `"*"` matches everything. `exclude` uses the same matching
-/// rules and always wins over `include`.
+/// `include` entries match by course id, schedule id, exact course name, or
+/// JSON `{"course_id": ..., "name": ...}` entries saved by `config.sh`;
+/// the wildcard `"*"` or `auto_include_new_courses = true` matches everything.
+/// `exclude` uses the same matching rules and always wins over `include`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CourseFilter {
     all: bool,
+    auto_include_new_courses: bool,
     include_ids: HashSet<String>,
     include_names: HashSet<String>,
     exclude_ids: HashSet<String>,
@@ -26,7 +36,14 @@ fn split_entries(entries: &[String]) -> (HashSet<String>, HashSet<String>) {
         if entry == "*" {
             continue;
         }
-        if entry.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(saved) = serde_json::from_str::<PersistedCourseTarget>(entry) {
+            if let Some(id) = saved.course_id.filter(|id| !id.is_empty()) {
+                ids.insert(id);
+            }
+            if let Some(name) = saved.name.filter(|name| !name.is_empty()) {
+                names.insert(name);
+            }
+        } else if entry.chars().all(|c| c.is_ascii_digit()) {
             ids.insert(entry.clone());
         } else {
             names.insert(entry.clone());
@@ -37,15 +54,28 @@ fn split_entries(entries: &[String]) -> (HashSet<String>, HashSet<String>) {
 
 impl CourseFilter {
     pub fn new(include: &[String], exclude: &[String]) -> Self {
+        Self::with_auto_include(include, exclude, false)
+    }
+
+    pub fn with_auto_include(
+        include: &[String],
+        exclude: &[String],
+        auto_include_new_courses: bool,
+    ) -> Self {
         let (include_ids, include_names) = split_entries(include);
         let (exclude_ids, exclude_names) = split_entries(exclude);
         Self {
-            all: include.iter().any(|e| e == "*"),
+            all: auto_include_new_courses || include.iter().any(|e| e == "*"),
+            auto_include_new_courses,
             include_ids,
             include_names,
             exclude_ids,
             exclude_names,
         }
+    }
+
+    pub fn auto_include_new_courses(&self) -> bool {
+        self.auto_include_new_courses
     }
 
     fn hits(
@@ -77,15 +107,53 @@ impl CourseFilter {
                 name,
             )
     }
+
+    /// Context-aware match: if an explicitly included course_id appears in
+    /// `schedules`, other parallel sections with the same course name also match
+    /// (unless excluded).
+    pub fn matches_in_schedules(
+        &self,
+        target: &crate::client::Schedule,
+        schedules: &[crate::client::Schedule],
+    ) -> bool {
+        if Self::hits(
+            &self.exclude_ids,
+            &self.exclude_names,
+            &target.course_id,
+            &target.id,
+            &target.name,
+        ) {
+            return false;
+        }
+        if self.all
+            || Self::hits(
+                &self.include_ids,
+                &self.include_names,
+                &target.course_id,
+                &target.id,
+                &target.name,
+            )
+        {
+            return true;
+        }
+        schedules.iter().any(|s| {
+            (self.include_ids.contains(&s.course_id) || self.include_ids.contains(&s.id))
+                && s.name == target.name
+        })
+    }
 }
 
 impl From<&crate::config::StudentEntry> for CourseFilter {
     fn from(entry: &crate::config::StudentEntry) -> Self {
-        Self::new(&entry.course_ids, &entry.exclude_courses)
+        Self::with_auto_include(
+            &entry.course_ids,
+            &entry.exclude_courses,
+            entry.auto_include_new_courses,
+        )
     }
 }
 
-/// Parse an iclass datetime string "YYYY-MM-DD HH:MM[:SS]" → UNIX seconds (UTC+8→UTC).
+/// Parse an iclass datetime string "YYYY-MM-DD HH:MM[:SS]" -> UNIX seconds (UTC+8->UTC).
 pub fn parse_class_time(s: &str) -> Option<u64> {
     // Format: "2024-03-01 08:00:00" or "2024-03-01 08:00"
     let fmt_full =
@@ -112,6 +180,29 @@ pub fn first_run_at(class_start_secs: u64, now: u64) -> u64 {
     class_start_secs
         .saturating_sub(PRE_CLASS_WINDOW_SECS)
         .max(now)
+}
+
+/// Plan from ten to one minute before class; schedule immediately if discovered late.
+#[allow(dead_code)]
+pub fn run_at_from(class_start_secs: u64, now_secs: u64) -> Option<u64> {
+    if now_secs >= class_start_secs {
+        return None;
+    }
+    let earliest = class_start_secs.saturating_sub(600).max(now_secs);
+    let latest = class_start_secs.saturating_sub(60);
+    if earliest >= latest {
+        return Some(now_secs);
+    }
+    Some(rand::rng().random_range(earliest..=latest))
+}
+
+#[allow(dead_code)]
+pub fn matches_manual_target(
+    target: &crate::client::Schedule,
+    schedules: &[crate::client::Schedule],
+    course_ids: &[String],
+) -> bool {
+    CourseFilter::new(course_ids, &[]).matches_in_schedules(target, schedules)
 }
 
 /// Enqueue tasks for a single student based on their schedules.
@@ -143,7 +234,7 @@ pub async fn plan_tasks(
         }
         let passing: Vec<&&crate::client::Schedule> = members
             .iter()
-            .filter(|s| filter.matches(&s.course_id, &s.id, &s.name))
+            .filter(|s| filter.matches_in_schedules(s, schedules))
             .collect();
         if passing.is_empty() {
             continue;
@@ -176,6 +267,7 @@ pub async fn plan_tasks(
         queue
             .push(Task {
                 run_at,
+                class_start,
                 student_id: student_id.to_owned(),
                 schedule_id: representative.id.clone(),
                 course_id: representative.course_id.clone(),
@@ -188,6 +280,7 @@ pub async fn plan_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Schedule;
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -203,11 +296,23 @@ mod tests {
         course_num: &str,
         time: &str,
         status: &str,
-    ) -> crate::client::Schedule {
+    ) -> Schedule {
         serde_json::from_value(serde_json::json!({
             "id": id, "courseId": course_id, "courseNum": course_num,
             "courseName": "平行课测试", "teacherName": "T",
             "classBeginTime": time, "signStatus": status
+        }))
+        .unwrap()
+    }
+
+    fn schedule(id: &str, course_id: &str, name: &str, teacher: &str) -> Schedule {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "courseId": course_id,
+            "courseName": name,
+            "teacherName": teacher,
+            "classBeginTime": "2026-09-28 08:00:00",
+            "signStatus": "0"
         }))
         .unwrap()
     }
@@ -220,32 +325,14 @@ mod tests {
     async fn parallel_sections_collapse_into_one_group_task() {
         let q = TaskQueue::new();
         let scheds = vec![
-            sched(
-                "2531631",
-                "100122",
-                "D391063001",
-                "2100-01-01 08:00:00",
-                "0",
-            ),
-            sched(
-                "2531630",
-                "100121",
-                "D391063001",
-                "2100-01-01 08:00:00",
-                "0",
-            ),
-            sched(
-                "2557706",
-                "102698",
-                "D391063001",
-                "2100-01-01 08:00:00",
-                "0",
-            ),
+            sched("2531631", "100122", "D391063001", "2100-01-01 08:00:00", "0"),
+            sched("2531630", "100121", "D391063001", "2100-01-01 08:00:00", "0"),
+            sched("2557706", "102698", "D391063001", "2100-01-01 08:00:00", "0"),
         ];
         plan_tasks(&q, "s1", &scheds, &filter(&["*"], &[])).await;
         let tasks = drain_ready(&q).await;
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].schedule_id, "2531630"); // 最小 id 作代表
+        assert_eq!(tasks[0].schedule_id, "2531630");
         let mut want = vec!["2531630", "2531631", "2557706"];
         let mut got: Vec<&str> = tasks[0].group.iter().map(|s| s.as_str()).collect();
         want.sort_unstable();
@@ -339,5 +426,24 @@ mod tests {
         assert_eq!(first_run_at(1_000, 0), 400);
         assert_eq!(first_run_at(1_000, 500), 500);
         assert_eq!(first_run_at(1_000, 1_500), 1_500);
+    }
+
+    #[test]
+    fn selected_course_includes_same_name_other_teacher() {
+        let schedules = [
+            schedule("s1", "11", "高数", "甲"),
+            schedule("s2", "12", "高数", "乙"),
+            schedule("s3", "13", "英语", "乙"),
+        ];
+        let targets = vec![r#"{"course_id":"11","name":"高数"}"#.to_owned()];
+        assert!(matches_manual_target(&schedules[1], &schedules, &targets));
+        assert!(!matches_manual_target(&schedules[2], &schedules, &targets));
+        assert!(matches_manual_target(&schedules[1], &schedules, &["11".into()]));
+    }
+
+    #[test]
+    fn late_discovery_runs_now_before_start() {
+        assert_eq!(run_at_from(1000, 980), Some(980));
+        assert_eq!(run_at_from(1000, 1000), None);
     }
 }

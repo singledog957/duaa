@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::Rng;
 use tracing::{debug, info, warn};
 
-use crate::AppState;
-
 use super::{scheduler::parse_class_time, CHECKIN_RETRY_INTERVAL_SECS, POST_CLASS_WINDOW_SECS};
+use crate::AppState;
 
 /// Fallback cap when the schedule carries no end time.
 const MAX_ATTEMPTS_WITHOUT_END: u32 = 20;
@@ -27,7 +27,6 @@ pub async fn run(state: Arc<AppState>) {
                     &task.group,
                 )
                 .await;
-                s.queue.finish(&task.student_id, &task.schedule_id).await;
             });
         }
 
@@ -43,7 +42,7 @@ pub async fn run(state: Arc<AppState>) {
     }
 }
 
-/// Execute one check-in task with dynamic validation and one retry on transient failure.
+/// Execute one check-in task with dynamic validation, 8081 retries, and 8082 fallback.
 async fn execute_task(
     state: &AppState,
     student_id: &str,
@@ -63,7 +62,7 @@ async fn execute_task(
 
     // 2. Dynamic validation: fetch today's schedule and confirm sched is unsigned.
     let today = today_str();
-    let schedules = match state.client.query_schedule_force(student_id, &today).await {
+    let schedules = match state.client.refresh_schedule(student_id, &today).await {
         Ok(s) => s,
         Err(e) => {
             warn!(student = student_id, err = %e, "pre-checkin schedule fetch failed; skipping");
@@ -71,7 +70,7 @@ async fn execute_task(
         }
     };
 
-    let target = schedules.iter().find(|s| s.course_id == course_id);
+    let target = schedules.iter().find(|s| s.id == schedule_id);
     match target {
         None => {
             info!(
@@ -92,7 +91,7 @@ async fn execute_task(
             return;
         }
         // Hot-reload may have excluded this course after the task was enqueued.
-        Some(s) if !filter.matches(&s.course_id, &s.id, &s.name) => {
+        Some(s) if !filter.matches_in_schedules(s, &schedules) => {
             info!(
                 student = student_id,
                 sched = schedule_id,
@@ -108,9 +107,10 @@ async fn execute_task(
     //    10 minutes after class; only then use the 8082 fallback.
     let end_unix = schedules
         .iter()
-        .find(|s| s.course_id == course_id)
-        .and_then(|s| s.end_time.as_deref())
-        .and_then(parse_class_time);
+        .filter(|s| group.contains(&s.id) || s.id == schedule_id)
+        .filter_map(|s| s.end_time.as_deref().and_then(parse_class_time))
+        .max();
+
     match run_checkin_with_retries(state, student_id, schedule_id, course_id, group, end_unix).await
     {
         Ok(attempts) => {
@@ -123,7 +123,13 @@ async fn execute_task(
             );
         }
         Err(e) => {
-            warn!(student = student_id, sched = schedule_id, course_id = course_id, err = %e, "checkin failed; giving up");
+            warn!(
+                student = student_id,
+                sched = schedule_id,
+                course_id = course_id,
+                err = %e,
+                "checkin failed; giving up"
+            );
         }
     }
 }
@@ -131,7 +137,8 @@ async fn execute_task(
 /// Keep attempting the signed 8081 path every
 /// [`CHECKIN_RETRY_INTERVAL_SECS`] until it succeeds, the class ends
 /// (+[`POST_CLASS_WINDOW_SECS`]), or a permanently fatal error surfaces.
-/// Once that window is over, try the unsigned 8082 path exactly once.
+/// Once that window is over (or if no secret provider is configured), run the
+/// unsigned 8082 fallback with one jittered retry.
 async fn run_checkin_with_retries(
     state: &AppState,
     student_id: &str,
@@ -147,8 +154,6 @@ async fn run_checkin_with_retries(
             match do_signed_checkin(state, student_id, schedule_id, group).await {
                 Ok(()) => return Ok(attempt),
                 Err(e) => {
-                    // Parallel-section groups share sign status; a member may have
-                    // been signed by an earlier round, another device, or manually.
                     if group_signed(state, student_id, group).await {
                         info!(
                             student = student_id,
@@ -190,8 +195,31 @@ async fn run_checkin_with_retries(
         );
     }
 
-    do_fallback_checkin(state, student_id, schedule_id, group).await?;
-    Ok(attempt)
+    match do_fallback_checkin(state, student_id, schedule_id, group).await {
+        Ok(()) => Ok(attempt),
+        Err(e) => {
+            let jitter: u64 = rand::rng().random_range(1..=5);
+            warn!(
+                student = student_id,
+                sched = schedule_id,
+                course_id = course_id,
+                err = %e,
+                retry_secs = jitter,
+                "8082 fallback failed; retrying once"
+            );
+            tokio::time::sleep(Duration::from_secs(jitter)).await;
+            if group_signed(state, student_id, group).await {
+                info!(
+                    student = student_id,
+                    sched = schedule_id,
+                    "checkin already confirmed after error"
+                );
+                return Ok(attempt);
+            }
+            do_fallback_checkin(state, student_id, schedule_id, group).await?;
+            Ok(attempt + 1)
+        }
+    }
 }
 
 async fn do_signed_checkin(
@@ -234,7 +262,7 @@ async fn group_signed(state: &AppState, student_id: &str, group: &[String]) -> b
         return false;
     }
     let today = today_str();
-    match state.client.query_schedule_force(student_id, &today).await {
+    match state.client.refresh_schedule(student_id, &today).await {
         Ok(scheds) => scheds
             .iter()
             .any(|s| group.contains(&s.id) && s.status() == 1),

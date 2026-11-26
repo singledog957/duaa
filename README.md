@@ -52,6 +52,7 @@ date
 - `sso_password`：统一认证密码
 - `course_ids`：需要自动签到的课程列表，条目可以是课程 ID 或课程名；填 `["*"]` 表示全部课程自动签到
 - `exclude_courses`：排除列表（可选），条目同样支持课程 ID 或课程名，优先级高于 `course_ids`——配合 `["*"]` 即可「全签但跳过某几门」
+- `auto_include_new_courses`：可选布尔值（默认 `false`），为 `true` 时自动纳入本周及下周新增课程（支持按周提前拉课表，同样受 `exclude_courses` 约束）
 - `secret_url`：可选的 **8081 官方扫码签到**凭据提供器地址（例如 `http://127.0.0.1:9101/secret`）；配置后优先走 8081 扫码签名接口，失败自动回退 8082；不配置则直接走 8082（8082 端口可能不稳定）
 - `poll_interval_minutes`：轮询课表间隔
 - `auto_window_minutes`：自动签到时间窗口参数

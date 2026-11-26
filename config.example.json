@@ -5,18 +5,20 @@
   "students": [
     {
       "student_id": "22373000",
-      "name": "示例学生A（8081官方签名模式）",
+      "name": "示例学生A（8081扫码签名模式）",
       "sso_password": "your_sso_password_1",
       "secret_url": "http://127.0.0.1:9101/secret",
       "course_ids": ["*"],
-      "exclude_courses": ["体育"]
+      "exclude_courses": ["体育"],
+      "auto_include_new_courses": false
     },
     {
       "student_id": "22373001",
       "name": "示例学生B（8082直连模式）",
       "sso_password": "your_sso_password_2",
       "course_ids": ["91999", "高等数学"],
-      "exclude_courses": []
+      "exclude_courses": [],
+      "auto_include_new_courses": false
     }
   ]
 }

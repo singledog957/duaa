@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
 
@@ -21,6 +22,7 @@ pub struct StudentEntry {
     pub secret_url: Option<String>,
     pub course_ids: Vec<String>,
     pub exclude_courses: Vec<String>,
+    pub auto_include_new_courses: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +46,8 @@ struct RawStudentEntry {
     course_ids: Option<Vec<String>>,
     #[serde(default)]
     exclude_courses: Option<Vec<String>>,
+    #[serde(default)]
+    auto_include_new_courses: bool,
 }
 
 fn default_poll() -> u64 {
@@ -76,25 +80,28 @@ impl Config {
             .map_err(|e| format!("config parse error at {}: {e}", path_ref.display()))?;
 
         let mut students = Vec::new();
+        let mut seen_ids = HashSet::new();
         for (idx, s) in raw_cfg.students.into_iter().enumerate() {
             let Some(student_id) = s.student_id else {
                 warn!(index = idx, "skip student entry: missing student_id");
                 continue;
             };
-            let Some(course_ids) = s.course_ids else {
-                warn!(student = %student_id, "skip student entry: missing course_ids");
-                continue;
-            };
-            if course_ids.is_empty() {
+            let course_ids = s.course_ids.unwrap_or_default();
+            if course_ids.is_empty() && !s.auto_include_new_courses {
                 warn!(student = %student_id, "skip student entry: empty course_ids");
                 continue;
             }
+            let student_id = student_id.trim().to_ascii_lowercase();
             let Some(sso_password) = s.sso_password.or(s.password) else {
                 warn!(student = %student_id, "skip student entry: missing sso_password");
                 continue;
             };
             if sso_password.trim().is_empty() {
                 warn!(student = %student_id, "skip student entry: empty sso_password");
+                continue;
+            }
+            if student_id.is_empty() || !seen_ids.insert(student_id.clone()) {
+                warn!(student = %student_id, "skip student entry: empty or duplicate student_id");
                 continue;
             }
 
@@ -106,6 +113,7 @@ impl Config {
                 secret_url: s.secret_url,
                 course_ids,
                 exclude_courses: s.exclude_courses.unwrap_or_default(),
+                auto_include_new_courses: s.auto_include_new_courses,
             });
         }
 

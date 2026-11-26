@@ -582,6 +582,11 @@ impl ClassClient {
         }
     }
 
+    /// Alias used by weekly/worker pipelines: bypass cache and refresh via tolerant fetch.
+    pub async fn refresh_schedule(&self, student_id: &str, date: &str) -> AppResult<Vec<Schedule>> {
+        self.query_schedule_force(student_id, date).await
+    }
+
     pub async fn query_course_schedule(
         &self,
         student_id: &str,
