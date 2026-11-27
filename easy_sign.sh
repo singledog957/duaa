@@ -11,8 +11,8 @@ SSO_LOGIN_URL="https://sso.buaa.edu.cn/login"
 JUMP_URL="https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter"
 LOGIN_BUAA_URL="https://iclass.buaa.edu.cn:8346/eschool/app/user/login_buaa.do"
 SCHEDULE_URL="https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action"
-CHECKIN_URL="http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action"
-TIMESTAMP_URL="http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action"
+CHECKIN_URL="http://iclass.buaa.edu.cn:8082/eschool/app/course/stu_scan_sign.action"
+TIMESTAMP_URL="http://iclass.buaa.edu.cn:8082/app/common/get_timestamp.action"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 log() {
