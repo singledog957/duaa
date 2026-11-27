@@ -4,7 +4,7 @@
 
 - **`deploy/Dockerfile` & `deploy/docker-compose.yml`**：将 `duaa` 与按需开启的运维看板容器化（`duaa` 与账号容器均配置 `restart: unless-stopped` 异常自动重启；配置通过宿主机 `config.json` 热加载）。
 - **`deploy/accounts/`**：8081 官方签名模式所需的无头 i北航（企业微信）账号容器套件（每名需要走 8081 的学生 1 个容器，登录态持久化在独立 Docker volume，端口仅绑定 `127.0.0.1`）。
-- **`deploy/dashboard/`**：模块化 Web 运维看板，支持按需临时开启（默认 **20 分钟后自动关闭**），可直接在网页内创建/删除 8081 账号容器、放大扫码、配置 8081/8082 学生、查看宿主机监控与实时日志。
+- **`deploy/dashboard/`**：模块化 Web 运维看板，默认仅本机常驻（`127.0.0.1:9080`），支持通过 `--expose` 临时对外暴露（默认 **10 分钟后自动销毁**并自动生成一次性口令），可在网页内创建/删除 8081 账号容器、放大扫码、配置 8081/8082 学生、查看宿主机监控与实时日志。
 - **`deploy/manage.sh`**：统一管理脚本。
 
 > **运行环境要求**：本部署套件仅支持 **Linux `x86_64`（amd64）** 宿主机，需安装 Docker 与 Docker Compose v2。部署前请确认宿主机系统时间准确（`date`）。
@@ -51,33 +51,36 @@ bash deploy/manage.sh build
 
 > 镜像构建默认使用 USTC apt 镜像源（`mirrors.ustc.edu.cn`），如需覆盖可执行 `docker build --build-arg APT_MIRROR="" -t duaa-account:latest deploy/accounts`。
 
-### 第 3 步：启动后台服务并临时开启运维看板
+### 第 3 步：启动后台服务并开启运维看板
 
 ```bash
 # 启动后台常驻服务（duaa 与已有 8081 账号容器；不会自动开启看板）
 bash deploy/manage.sh up
 
-# 临时开启运维看板（默认监听 127.0.0.1:9080，20 分钟后自动关闭）
+# 默认开启本机运维看板（仅监听 127.0.0.1:9080，不自动销毁）
 bash deploy/manage.sh dashboard on
 
-# 自定义自动关闭时长（例如 10 分钟；传 0 表示不自动关闭）
-bash deploy/manage.sh dashboard on 10
+# 本机模式也可按需指定自动销毁时长（例如 30 分钟）
+bash deploy/manage.sh dashboard on --ttl 30
 
-# 如仅需本机/SSH 端口转发访问，可加 --local（仅监听 127.0.0.1:9080）
-bash deploy/manage.sh dashboard on 20 --local
+# 临时对外暴露到 0.0.0.0:9080（默认 10 分钟后自动关闭并销毁容器，未设口令时自动生成一次性随机口令）
+bash deploy/manage.sh dashboard on --expose
+
+# 自定义临时暴露的自动销毁时长（例如 15 分钟；禁止设为 0）
+bash deploy/manage.sh dashboard on --expose --ttl 15
 ```
 
 默认通过本机或 SSH 转发访问：`ssh -L 9080:127.0.0.1:9080 user@server`，然后打开 `http://127.0.0.1:9080`。
-如需监听其他地址，必须设置访问口令：
+使用 `--expose` 临时暴露到 `0.0.0.0` 时，若未提前设置 `DASHBOARD_TOKEN`，脚本会自动生成一次性随机口令并在终端打印；也可手动指定固定口令：
 
 ```bash
 export DASHBOARD_TOKEN='替换为随机长口令'
-DASHBOARD_BIND=0.0.0.0 bash deploy/manage.sh dashboard on
+bash deploy/manage.sh dashboard on --expose --ttl 15
 ```
 
-浏览器弹出登录框时，用户名填 `admin`，密码填 `DASHBOARD_TOKEN`。设置口令后，本机访问同样需要登录；所有页面和 API 均受保护。HTTP Basic 不加密传输内容，远程访问请通过 SSH 转发或 HTTPS 反向代理。命令行查看倒计时时也需保留 `DASHBOARD_TOKEN` 环境变量。
+浏览器弹出登录框时，用户名填 `admin`，密码填终端打印的一次性口令（或 `DASHBOARD_TOKEN`）。设置口令后，本机访问同样需要登录；所有页面和 API 均受保护。HTTP Basic 不加密传输内容，公网远程访问仍建议优先使用 SSH 转发或 HTTPS 反向代理。命令行查看倒计时时传入对应 `DASHBOARD_TOKEN` 环境变量即可。
 
-使用完毕后可直接等待倒计时自动关闭，或在页面左下角点击「**立即关闭**」，也可命令行立即关闭（不影响 `duaa` 与账号容器后台自动签到）：
+使用完毕后，临时暴露模式会在到期后自动关闭并销毁容器，也可在页面左下角点击「**立即关闭**」或通过命令行随时关闭（不影响 `duaa` 与账号容器后台自动签到）：
 
 ```bash
 bash deploy/manage.sh dashboard off
@@ -107,7 +110,8 @@ bash deploy/manage.sh dashboard off
 bash deploy/manage.sh build                    # 构建 8081 账号基础镜像
 bash deploy/manage.sh up                       # 启动全部账号容器 + duaa（不开启看板）
 bash deploy/manage.sh up duaa                  # 仅构建并启动 duaa
-bash deploy/manage.sh dashboard on [分]        # 临时开启看板（默认 20 分钟自动关闭，可加 --local）
+bash deploy/manage.sh dashboard on                   # 开启本机看板（127.0.0.1:9080，不自动销毁；可加 --ttl 分）
+bash deploy/manage.sh dashboard on --expose [分]     # 临时暴露到 0.0.0.0:9080（默认 10 分钟自动销毁，自动生成一次性口令）
 bash deploy/manage.sh dashboard off            # 立即关闭看板
 bash deploy/manage.sh dashboard status         # 查看看板开关状态与剩余倒计时
 bash deploy/manage.sh add stu1 9101            # 命令行新增 8081 账号容器
@@ -131,7 +135,7 @@ docker exec duaa /usr/local/bin/duaa --config config.json --status
 
 ## 安全说明
 
-- **默认仅限本机访问**：运维看板挂载了 `/var/run/docker.sock` 用于管理账号容器，默认监听 `127.0.0.1`。其他监听地址必须设置 `DASHBOARD_TOKEN`，否则拒绝启动；仍建议通过 SSH 转发或 HTTPS 反向代理访问。默认采用按需开启 + 20 分钟自动关闭（`restart: "no"`）。
+- **默认仅限本机访问，对外暴露限时且强制鉴权**：运维看板挂载了 `/var/run/docker.sock` 用于管理账号容器，默认仅监听 `127.0.0.1`（不自动销毁；如在多人共用服务器上运行，建议用完执行 `dashboard off` 或设置 `DASHBOARD_TOKEN`）。使用 `--expose` 对外暴露到 `0.0.0.0` 时默认 **10 分钟后自动销毁容器**（禁止设为永久），并强制启用 `DASHBOARD_TOKEN`（未设置时自动生成一次性随机口令）；公网访问仍建议优先通过 SSH 转发或 HTTPS 反向代理。
 - **8081 Provider 仅限本机**：所有账号容器端口均只绑定 `127.0.0.1:<port>`，不对外网或局域网暴露。
 - **日志读取隔离**：看板接口强制限制 `log_file` 必须位于仓库 `logs/` 目录下，防止路径穿越读取配置文件等敏感文件。
 - **动态上游 DNS 与日志限额**：账号容器内透明代理 `tproxy2.py` 通过容器上游 DNS 动态解析域名（无硬编码 IP），并自带 5 MiB 日志自动截断。

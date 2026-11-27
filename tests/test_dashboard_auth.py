@@ -77,11 +77,61 @@ class DashboardAuthTests(unittest.TestCase):
                 server.validate_bind(bind, '')
         server.validate_bind('127.0.0.1', '')
         server.validate_bind('0.0.0.0', 'configured-token')
+        server.validate_bind('0.0.0.0', 'configured-token', 10)
         result = subprocess.run([sys.executable, str(ROOT / 'deploy/dashboard/server.py')],
                                 env={**os.environ, 'DASHBOARD_BIND': '0.0.0.0', 'DASHBOARD_TOKEN': ''},
                                 capture_output=True, text=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('DASHBOARD_TOKEN', result.stderr)
+
+    def test_default_ttl_and_nonlocal_ttl_policy(self):
+        self.assertEqual(server.default_ttl_minutes('127.0.0.1', None), 0)
+        self.assertEqual(server.default_ttl_minutes('127.0.0.1', ''), 0)
+        self.assertEqual(server.default_ttl_minutes('::1', ''), 0)
+        self.assertEqual(server.default_ttl_minutes('0.0.0.0', None), 10)
+        self.assertEqual(server.default_ttl_minutes('0.0.0.0', ''), 10)
+        self.assertEqual(server.default_ttl_minutes('0.0.0.0', '15'), 15)
+        self.assertEqual(server.default_ttl_minutes('127.0.0.1', '30'), 30)
+
+        server.validate_bind('127.0.0.1', '', 0)
+        with self.assertRaises(ValueError):
+            server.validate_bind('0.0.0.0', 'configured-token', 0)
+
+        result = subprocess.run([sys.executable, str(ROOT / 'deploy/dashboard/server.py')],
+                                env={**os.environ,
+                                     'DASHBOARD_BIND': '0.0.0.0',
+                                     'DASHBOARD_TOKEN': 'configured-token',
+                                     'DASHBOARD_TTL_MINUTES': '0'},
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('DASHBOARD_TTL_MINUTES', result.stderr)
+
+    def test_manage_sh_dashboard_validation(self):
+        script = str(ROOT / 'deploy/manage.sh')
+        # --expose 0 must be rejected
+        res = subprocess.run(['bash', script, 'dashboard', 'on', '--expose', '0'],
+                             capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('大于 0', res.stderr)
+
+        # --expose --ttl 0 must be rejected
+        res = subprocess.run(['bash', script, 'dashboard', 'on', '--expose', '--ttl', '0'],
+                             capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('大于 0', res.stderr)
+
+        # Direct non-loopback DASHBOARD_BIND without --expose or token must be rejected
+        env = {k: v for k, v in os.environ.items() if k != 'DASHBOARD_TOKEN'}
+        env['DASHBOARD_BIND'] = '0.0.0.0'
+        res = subprocess.run(['bash', script, 'dashboard', 'on'],
+                             env=env, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('DASHBOARD_TOKEN', res.stderr)
+
+        # Invalid --ttl must be rejected
+        res = subprocess.run(['bash', script, 'dashboard', 'on', '--ttl', 'abc'],
+                             capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(res.returncode, 0)
 
 
 if __name__ == '__main__':

@@ -17,7 +17,7 @@ usage() {
   restart|stop NAME                       生命周期管理（支持 duaa / 账号名）
   rm NAME [--purge]                       停止并移除账号容器（加 --purge 同时删除目录与数据卷）
   up|down|logs [NAME]                     管理后台常驻服务（up 不自动开启看板）
-  dashboard on [MINUTES] [--local]        临时开启运维看板（默认 20 分钟后自动关闭；0=不自动关闭）
+  dashboard on [--expose] [--ttl M | M]   开启运维看板（默认 127.0.0.1 常驻；--expose 暴露 0.0.0.0 默认 10 分钟自动销毁）
   dashboard off                           立即关闭运维看板
   dashboard status|logs                   查看看板开关状态/倒计时或日志
   list                                    列出账号实例与端口
@@ -90,21 +90,25 @@ dashboard_status_line() {
     echo "dashboard    OFF (已关闭)"
     return
   fi
-  local info
+  local resp http_code info
   local curl_auth=()
   [ -z "${DASHBOARD_TOKEN:-}" ] || curl_auth=(--user "admin:${DASHBOARD_TOKEN}")
-  info=$(curl "${curl_auth[@]}" -fsS --max-time 2 "http://127.0.0.1:${DASHBOARD_PORT:-9080}/healthz" 2>/dev/null || true)
-  if [ -n "$info" ]; then
+  resp=$(curl "${curl_auth[@]}" -sS --max-time 2 -w $'\n%{http_code}' "http://127.0.0.1:${DASHBOARD_PORT:-9080}/healthz" 2>/dev/null || true)
+  http_code=$(printf '%s' "$resp" | tail -n 1)
+  info=$(printf '%s' "$resp" | sed '$d')
+  if [ "$http_code" = "200" ] && [ -n "$info" ]; then
     python3 -c '
 import json, sys
 d = json.loads(sys.argv[1])
 a = d.get("auto_shutdown") or {}
 if a.get("enabled"):
     rem = int(a.get("remaining_seconds") or 0)
-    print(f"dashboard    ON  (剩余 {rem // 60}m{rem % 60:02d}s，将于 {a.get("expires_at")} 自动关闭)")
+    print(f"dashboard    ON  (剩余 {rem // 60}m{rem % 60:02d}s，将于 {a.get(\"expires_at\")} 自动销毁)")
 else:
-    print("dashboard    ON  (未设置自动关闭)")
+    print("dashboard    ON  (仅本机常驻，未设置自动销毁)")
 ' "$info" 2>/dev/null || echo "dashboard    ON"
+  elif [ "$http_code" = "401" ]; then
+    echo "dashboard    ON  (已启用口令鉴权，传入 DASHBOARD_TOKEN 可查看剩余倒计时)"
   else
     echo "dashboard    ON  (启动中)"
   fi
@@ -141,7 +145,7 @@ case "$cmd" in
     write_compose "$name" "$http"
     compose "$name" up -d
     echo "账号容器 $name 就绪：provider=127.0.0.1:$http"
-    echo "下一步: bash deploy/manage.sh dashboard on   # 临时开启看板 :9080 扫码登录（20 分钟后自动关闭）"
+    echo "下一步: bash deploy/manage.sh dashboard on   # 开启本机看板 127.0.0.1:9080（临时对外暴露可加 --expose）"
     ;;
   login)
     [ $# -ge 1 ] || usage
@@ -267,7 +271,7 @@ case "$cmd" in
     if [ $# -ge 1 ]; then
       name=$1
       if [ "$name" = "dashboard" ]; then
-        root_compose --profile dashboard logs -f dashboard
+        docker logs -f duaa-dashboard
       elif [ "$name" = "duaa" ]; then
         root_compose logs -f duaa
       else
@@ -289,47 +293,122 @@ case "$cmd" in
     [ $# -ge 1 ] && shift
     case "$action" in
       on|up)
-        ttl=20
+        ttl=""
+        ttl_set=0
+        expose=0
         bind="${DASHBOARD_BIND:-127.0.0.1}"
         while [ $# -ge 1 ]; do
           case "$1" in
-            --local) bind="127.0.0.1" ;;
+            --local)
+              expose=0
+              bind="127.0.0.1"
+              ;;
+            --expose|--public)
+              expose=1
+              bind="0.0.0.0"
+              ;;
+            --ttl)
+              shift
+              if [ $# -lt 1 ] || ! printf '%s' "$1" | grep -qE '^[0-9]+$'; then
+                echo "无效的 --ttl 参数（需为非负整数分钟数）" >&2
+                exit 2
+              fi
+              ttl="$1"
+              ttl_set=1
+              ;;
+            --ttl=*)
+              ttl="${1#--ttl=}"
+              if ! printf '%s' "$ttl" | grep -qE '^[0-9]+$'; then
+                echo "无效的 --ttl 参数: $ttl（需为非负整数分钟数）" >&2
+                exit 2
+              fi
+              ttl_set=1
+              ;;
             *)
               if printf '%s' "$1" | grep -qE '^[0-9]+$'; then
                 ttl="$1"
+                ttl_set=1
               else
-                echo "无效参数: $1（用法: bash deploy/manage.sh dashboard on [分钟数，默认20，0=不自动关闭] [--local]）" >&2
+                echo "无效参数: $1（用法: bash deploy/manage.sh dashboard on [--expose] [--ttl 分钟数 | 分钟数]）" >&2
                 exit 2
               fi
               ;;
           esac
           shift
         done
-        if [ "$bind" != "127.0.0.1" ] && [ -z "${DASHBOARD_TOKEN:-}" ]; then
-          echo "非本机监听必须设置 DASHBOARD_TOKEN；默认使用 127.0.0.1，可通过 SSH 转发访问。" >&2
-          exit 1
+
+        is_loopback=0
+        case "$bind" in
+          127.*|::1) is_loopback=1 ;;
+        esac
+
+        if [ "$ttl_set" -eq 0 ]; then
+          if [ "$is_loopback" -eq 1 ]; then
+            ttl=0
+          else
+            ttl=10
+          fi
         fi
-        DASHBOARD_BIND="$bind" DASHBOARD_TTL_MINUTES="$ttl" \
-          root_compose --profile dashboard up -d --build --force-recreate --no-deps dashboard
+
+        token="${DASHBOARD_TOKEN:-}"
+        generated_token=0
+        if [ "$is_loopback" -eq 0 ]; then
+          if [ "$ttl" -le 0 ]; then
+            echo "非本机暴露必须设置大于 0 的自动销毁时长（分钟），例如: bash deploy/manage.sh dashboard on --expose 10" >&2
+            exit 1
+          fi
+          if [ -z "$token" ]; then
+            if [ "$expose" -eq 1 ]; then
+              token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))' 2>/dev/null \
+                || openssl rand -base64 18 | tr '+/' '-_' | tr -d '=')
+              generated_token=1
+            else
+              echo "非本机监听必须设置 DASHBOARD_TOKEN，或使用 --expose 自动生成一次性口令。" >&2
+              exit 1
+            fi
+          fi
+        fi
+
+        docker rm -f duaa-dashboard >/dev/null 2>&1 || true
         if [ "$ttl" -gt 0 ]; then
-          echo "运维看板已开启：http://${bind}:${DASHBOARD_PORT:-9080}（将在 ${ttl} 分钟后自动关闭）"
+          DASHBOARD_BIND="$bind" DASHBOARD_TTL_MINUTES="$ttl" DASHBOARD_TOKEN="$token" \
+            root_compose --profile dashboard build dashboard
+          DASHBOARD_BIND="$bind" DASHBOARD_TTL_MINUTES="$ttl" DASHBOARD_TOKEN="$token" \
+            root_compose --profile dashboard run --rm -d --name duaa-dashboard --no-deps dashboard >/dev/null
         else
-          echo "运维看板已开启：http://${bind}:${DASHBOARD_PORT:-9080}（已禁用自动关闭，使用 bash deploy/manage.sh dashboard off 手动关闭）"
+          DASHBOARD_BIND="$bind" DASHBOARD_TTL_MINUTES=0 DASHBOARD_TOKEN="$token" \
+            root_compose --profile dashboard up -d --build --force-recreate --no-deps dashboard
+        fi
+
+        port="${DASHBOARD_PORT:-9080}"
+        if [ "$is_loopback" -eq 0 ]; then
+          echo "运维看板已临时对外暴露：http://${bind}:${port}（将在 ${ttl} 分钟后自动关闭并销毁容器）"
+          if [ "$generated_token" -eq 1 ]; then
+            echo "一次性登录账号：admin"
+            echo "一次性登录口令：${token}"
+          else
+            echo "已启用 DASHBOARD_TOKEN 鉴权（用户名：admin）"
+          fi
+          echo "提示：如需提前关闭请执行 bash deploy/manage.sh dashboard off"
+        elif [ "$ttl" -gt 0 ]; then
+          echo "运维看板已开启（仅本机）：http://${bind}:${port}（将在 ${ttl} 分钟后自动关闭并销毁容器）"
+        else
+          echo "运维看板已开启（仅本机常驻）：http://${bind}:${port}（不自动销毁；使用 bash deploy/manage.sh dashboard off 关闭）"
         fi
         ;;
       off|stop)
-        root_compose --profile dashboard stop dashboard 2>/dev/null || true
-        root_compose --profile dashboard rm -f dashboard 2>/dev/null || true
+        docker rm -f duaa-dashboard >/dev/null 2>&1 || true
+        root_compose --profile dashboard rm -f dashboard >/dev/null 2>&1 || true
         echo "运维看板已关闭"
         ;;
       status)
         dashboard_status_line
         ;;
       logs)
-        root_compose --profile dashboard logs -f dashboard
+        docker logs -f duaa-dashboard
         ;;
       *)
-        echo "用法: bash deploy/manage.sh dashboard on [MINUTES] [--local] | off | status | logs" >&2
+        echo "用法: bash deploy/manage.sh dashboard on [--expose] [--ttl MINUTES | MINUTES] | off | status | logs" >&2
         exit 2
         ;;
     esac

@@ -70,7 +70,7 @@ Rust 常驻进程会随每轮轮询检查 `config.json`（即最迟 `poll_interv
 
 > **为什么推荐 8081？** 8081 是智慧教室官方的**扫码签到接口**，稳定性更高；原有的 8082 端口属于非扫码直连路径，**可能不稳定**。配置 `secret_url` 后，程序会优先走 8081 官方签名签到，仅在凭据不可用时回退 8082。
 
-本方案适合在 **Linux `x86_64`** 服务器上使用 Docker Compose 一键部署，包含 `duaa` 容器、8081 无头 i北航签票容器以及按需开启的 Web 运维看板（默认 20 分钟自动关闭，支持网页内增删账号容器、扫码登录与热加载配置）。完整部署步骤请见：
+本方案适合在 **Linux `x86_64`** 服务器上使用 Docker Compose 一键部署，包含 `duaa` 容器、8081 无头 i北航签票容器以及按需开启的 Web 运维看板（默认仅本机 `127.0.0.1:9080` 常驻，加 `--expose` 可临时对外暴露并默认 10 分钟自动销毁，支持网页内增删账号容器、扫码登录与热加载配置）。完整部署步骤请见：
 
 - 👉 **[`deploy/README.md`](./deploy/README.md)**
 
@@ -78,10 +78,11 @@ Rust 常驻进程会随每轮轮询检查 `config.json`（即最迟 `poll_interv
 
 ```bash
 cp config.example.json config.json
-bash deploy/manage.sh build              # 放入官方 Linux 客户端后构建 8081 基础镜像
-bash deploy/manage.sh up                 # 启动 duaa 与已有 8081 账号容器
-bash deploy/manage.sh dashboard on       # 临时开启运维看板（127.0.0.1:9080，默认 20 分钟后关闭）
-bash deploy/manage.sh dashboard off      # 手动关闭运维看板
+bash deploy/manage.sh build                    # 放入官方 Linux 客户端后构建 8081 基础镜像
+bash deploy/manage.sh up                       # 启动 duaa 与已有 8081 账号容器
+bash deploy/manage.sh dashboard on             # 开启本机运维看板（127.0.0.1:9080，不自动销毁）
+bash deploy/manage.sh dashboard on --expose    # 临时暴露到 0.0.0.0:9080（默认 10 分钟自动销毁，自动生成一次性口令）
+bash deploy/manage.sh dashboard off            # 手动关闭运维看板
 ```
 
 ## 方案二：Rust 常驻进程

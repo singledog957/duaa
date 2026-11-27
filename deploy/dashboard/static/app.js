@@ -793,9 +793,9 @@ setInterval(() => {
 
 $('ttl-extend').addEventListener('click', async () => {
   try {
-    const res = await apiJson('/api/dashboard/extend', 'POST', { minutes: 20 });
+    const res = await apiJson('/api/dashboard/extend', 'POST', { minutes: 10 });
     syncAutoShutdown(res.auto_shutdown);
-    toast('已重置自动关闭倒计时为 20 分钟');
+    toast('已重置自动关闭倒计时为 10 分钟');
   } catch (err) {
     toast(`续期失败：${err.message}`);
   }

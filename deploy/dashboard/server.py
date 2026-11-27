@@ -35,11 +35,24 @@ from accounts_api import (
 from config_api import CONFIG_PATH, config_mtime, public_config, validate_config, write_config
 from monitoring import HOST_COLLECTOR, collect_compose, collect_logs, now_iso
 
+def is_loopback_bind(bind: str) -> bool:
+    try:
+        return ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
+
+
+def default_ttl_minutes(bind: str, raw_ttl: str | None) -> int:
+    if raw_ttl is not None and str(raw_ttl).strip() != "":
+        return max(0, int(str(raw_ttl).strip()))
+    return 0 if is_loopback_bind(bind) else 10
+
+
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("DASHBOARD_PORT", "9080"))
 BIND = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
-DEFAULT_TTL_MINUTES = max(0, int(os.environ.get("DASHBOARD_TTL_MINUTES", "20")))
+DEFAULT_TTL_MINUTES = default_ttl_minutes(BIND, os.environ.get("DASHBOARD_TTL_MINUTES"))
 ACCOUNT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 CONFIG_BODY_LIMIT = 1024 * 1024
 
@@ -103,13 +116,12 @@ class AutoShutdown:
 AUTO_SHUTDOWN: AutoShutdown | None = None
 
 
-def validate_bind(bind: str, token: str):
-    try:
-        local = ipaddress.ip_address(bind).is_loopback
-    except ValueError:
-        local = False
+def validate_bind(bind: str, token: str, ttl_minutes: int | None = None):
+    local = is_loopback_bind(bind)
     if not local and not token:
         raise ValueError("非本机监听必须设置 DASHBOARD_TOKEN；或使用 DASHBOARD_BIND=127.0.0.1")
+    if not local and ttl_minutes is not None and int(ttl_minutes) <= 0:
+        raise ValueError("非本机监听必须设置大于 0 的自动销毁时长（DASHBOARD_TTL_MINUTES）")
 
 
 def _same_origin(handler) -> bool:
@@ -332,7 +344,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             if path == "/api/dashboard/extend":
                 payload = self._read_json_body(allow_empty=True)
-                minutes = int(payload.get("minutes") or DEFAULT_TTL_MINUTES or 20)
+                minutes = int(payload.get("minutes") or DEFAULT_TTL_MINUTES or 10)
                 if not AUTO_SHUTDOWN:
                     self._json({"error": "未启用定时器"}, 400)
                     return
@@ -400,7 +412,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
-    validate_bind(BIND, TOKEN)
+    validate_bind(BIND, TOKEN, DEFAULT_TTL_MINUTES)
     httpd = Server((BIND, PORT), Handler)
     AUTO_SHUTDOWN = AutoShutdown(httpd, DEFAULT_TTL_MINUTES)
     ttl_msg = f"auto-shutdown in {DEFAULT_TTL_MINUTES}m" if DEFAULT_TTL_MINUTES > 0 else "auto-shutdown disabled"
