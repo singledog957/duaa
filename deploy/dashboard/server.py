@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
+import binascii
 import datetime as dt
 import http.server
+import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -33,7 +37,8 @@ from monitoring import HOST_COLLECTOR, collect_compose, collect_logs, now_iso
 
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("DASHBOARD_PORT", "9080"))
-BIND = os.environ.get("DASHBOARD_BIND", "0.0.0.0")
+BIND = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
+TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 DEFAULT_TTL_MINUTES = max(0, int(os.environ.get("DASHBOARD_TTL_MINUTES", "20")))
 ACCOUNT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 CONFIG_BODY_LIMIT = 1024 * 1024
@@ -98,6 +103,15 @@ class AutoShutdown:
 AUTO_SHUTDOWN: AutoShutdown | None = None
 
 
+def validate_bind(bind: str, token: str):
+    try:
+        local = ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        local = False
+    if not local and not token:
+        raise ValueError("非本机监听必须设置 DASHBOARD_TOKEN；或使用 DASHBOARD_BIND=127.0.0.1")
+
+
 def _same_origin(handler) -> bool:
     origin = handler.headers.get("Origin")
     if not origin:
@@ -122,6 +136,29 @@ def overview() -> dict:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "duaa-dashboard/3.1"
+
+    def _authenticate(self):
+        if not TOKEN:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        scheme, _, credentials = supplied.partition(" ")
+        password = ""
+        if scheme.lower() == "basic":
+            try:
+                user, separator, candidate = base64.b64decode(credentials, validate=True).decode("utf-8").partition(":")
+                if user == "admin" and separator:
+                    password = candidate
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                pass
+        if password and hmac.compare_digest(password.encode("utf-8"), TOKEN.encode("utf-8")):
+            return True
+        body = b'{"error":"Authentication required"}'
+        self.send_response(401)
+        self._headers("application/json; charset=utf-8", len(body))
+        self.send_header("WWW-Authenticate", 'Basic realm="duaa-dashboard", charset="UTF-8"')
+        self.end_headers()
+        self.wfile.write(body)
+        return False
 
     def _headers(self, content_type, length, cache="no-store"):
         self.send_header("Content-Type", content_type)
@@ -194,6 +231,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._authenticate():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
@@ -238,6 +277,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500)
 
     def do_PUT(self):
+        if not self._authenticate():
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != "/api/config":
             self.send_error(404)
@@ -271,6 +312,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        if not self._authenticate():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if not _same_origin(self):
@@ -326,6 +369,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"error": str(exc)[:300]}, 502)
 
     def do_DELETE(self):
+        if not self._authenticate():
+            return
         parsed = urllib.parse.urlparse(self.path)
         if not _same_origin(self):
             self._json({"error": "跨域请求被拒绝"}, 403)
@@ -355,6 +400,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
+    validate_bind(BIND, TOKEN)
     httpd = Server((BIND, PORT), Handler)
     AUTO_SHUTDOWN = AutoShutdown(httpd, DEFAULT_TTL_MINUTES)
     ttl_msg = f"auto-shutdown in {DEFAULT_TTL_MINUTES}m" if DEFAULT_TTL_MINUTES > 0 else "auto-shutdown disabled"

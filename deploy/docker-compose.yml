@@ -26,7 +26,8 @@ services:
     command: ["python3", "deploy/dashboard/server.py"]
     network_mode: host
     environment:
-      DASHBOARD_BIND: ${DASHBOARD_BIND:-0.0.0.0}
+      DASHBOARD_BIND: ${DASHBOARD_BIND:-127.0.0.1}
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-9080}
       DASHBOARD_TTL_MINUTES: ${DASHBOARD_TTL_MINUTES:-20}
       DASHBOARD_DUAA_CONFIG: /app/${DUAA_CONFIG:-config.json}

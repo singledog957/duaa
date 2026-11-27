@@ -57,7 +57,7 @@ bash deploy/manage.sh build
 # 启动后台常驻服务（duaa 与已有 8081 账号容器；不会自动开启看板）
 bash deploy/manage.sh up
 
-# 临时开启运维看板（默认监听 0.0.0.0:9080，20 分钟后自动关闭）
+# 临时开启运维看板（默认监听 127.0.0.1:9080，20 分钟后自动关闭）
 bash deploy/manage.sh dashboard on
 
 # 自定义自动关闭时长（例如 10 分钟；传 0 表示不自动关闭）
@@ -67,6 +67,16 @@ bash deploy/manage.sh dashboard on 10
 bash deploy/manage.sh dashboard on 20 --local
 ```
 
+默认通过本机或 SSH 转发访问：`ssh -L 9080:127.0.0.1:9080 user@server`，然后打开 `http://127.0.0.1:9080`。
+如需监听其他地址，必须设置访问口令：
+
+```bash
+export DASHBOARD_TOKEN='替换为随机长口令'
+DASHBOARD_BIND=0.0.0.0 bash deploy/manage.sh dashboard on
+```
+
+浏览器弹出登录框时，用户名填 `admin`，密码填 `DASHBOARD_TOKEN`。设置口令后，本机访问同样需要登录；所有页面和 API 均受保护。HTTP Basic 不加密传输内容，远程访问请通过 SSH 转发或 HTTPS 反向代理。命令行查看倒计时时也需保留 `DASHBOARD_TOKEN` 环境变量。
+
 使用完毕后可直接等待倒计时自动关闭，或在页面左下角点击「**立即关闭**」，也可命令行立即关闭（不影响 `duaa` 与账号容器后台自动签到）：
 
 ```bash
@@ -75,7 +85,7 @@ bash deploy/manage.sh dashboard off
 
 ### 第 4 步：在看板中完成账号容器管理与签到配置
 
-打开浏览器访问 `http://<内网服务器IP>:9080`（或通过 `ssh -L 9080:127.0.0.1:9080` 访问 `http://127.0.0.1:9080`），界面分为 5 个模块：
+打开浏览器访问 `http://127.0.0.1:9080`（远程服务器先使用上述 SSH 转发；其他监听地址需使用口令登录），界面分为 5 个模块：
 
 1. **总览**：查看 `duaa` 引擎、8081 账号容器数、学生模式分布、宿主机概况与最近签到日志预览。
 2. **8081 账号容器**：
@@ -121,7 +131,15 @@ docker exec duaa /usr/local/bin/duaa --config config.json --status
 
 ## 安全说明
 
-- **仅限内网/本机临时使用**：运维看板无额外登录鉴权，且挂载了 `/var/run/docker.sock` 用于管理账号容器，**请勿将其暴露到公网**。默认采用按需开启 + 20 分钟自动关闭（`restart: "no"`），亦支持 `--local` 仅监听 `127.0.0.1`。
+- **默认仅限本机访问**：运维看板挂载了 `/var/run/docker.sock` 用于管理账号容器，默认监听 `127.0.0.1`。其他监听地址必须设置 `DASHBOARD_TOKEN`，否则拒绝启动；仍建议通过 SSH 转发或 HTTPS 反向代理访问。默认采用按需开启 + 20 分钟自动关闭（`restart: "no"`）。
 - **8081 Provider 仅限本机**：所有账号容器端口均只绑定 `127.0.0.1:<port>`，不对外网或局域网暴露。
 - **日志读取隔离**：看板接口强制限制 `log_file` 必须位于仓库 `logs/` 目录下，防止路径穿越读取配置文件等敏感文件。
 - **动态上游 DNS 与日志限额**：账号容器内透明代理 `tproxy2.py` 通过容器上游 DNS 动态解析域名（无硬编码 IP），并自带 5 MiB 日志自动截断。
+
+## 回归验证（无需 Docker 或真实账号）
+
+```bash
+cargo test --locked
+node --test tests/dashboard-config.cjs
+python3 -m unittest discover -s tests -p 'test_dashboard*.py'
+```

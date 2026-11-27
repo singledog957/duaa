@@ -91,7 +91,9 @@ dashboard_status_line() {
     return
   fi
   local info
-  info=$(curl -fsS --max-time 2 "http://127.0.0.1:${DASHBOARD_PORT:-9080}/healthz" 2>/dev/null || true)
+  local curl_auth=()
+  [ -z "${DASHBOARD_TOKEN:-}" ] || curl_auth=(--user "admin:${DASHBOARD_TOKEN}")
+  info=$(curl "${curl_auth[@]}" -fsS --max-time 2 "http://127.0.0.1:${DASHBOARD_PORT:-9080}/healthz" 2>/dev/null || true)
   if [ -n "$info" ]; then
     python3 -c '
 import json, sys
@@ -288,7 +290,7 @@ case "$cmd" in
     case "$action" in
       on|up)
         ttl=20
-        bind="${DASHBOARD_BIND:-0.0.0.0}"
+        bind="${DASHBOARD_BIND:-127.0.0.1}"
         while [ $# -ge 1 ]; do
           case "$1" in
             --local) bind="127.0.0.1" ;;
@@ -303,6 +305,10 @@ case "$cmd" in
           esac
           shift
         done
+        if [ "$bind" != "127.0.0.1" ] && [ -z "${DASHBOARD_TOKEN:-}" ]; then
+          echo "非本机监听必须设置 DASHBOARD_TOKEN；默认使用 127.0.0.1，可通过 SSH 转发访问。" >&2
+          exit 1
+        fi
         DASHBOARD_BIND="$bind" DASHBOARD_TTL_MINUTES="$ttl" \
           root_compose --profile dashboard up -d --build --force-recreate --no-deps dashboard
         if [ "$ttl" -gt 0 ]; then

@@ -221,7 +221,30 @@ function renderAccountsTab() {
 /* ── Config Tab (Unified 8081 / 8082) ─────────────────────────────────────── */
 
 function splitList(v) {
-  return String(v || '').split(/[,，\n]/).map(s => s.trim()).filter(Boolean);
+  // config.sh stores JSON objects as strings. Delimiters inside those objects
+  // (including escaped quotes in course names) belong to the entry itself.
+  const entries = [];
+  let entry = '', depth = 0, quoted = false, escaped = false;
+  for (const ch of String(v || '')) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quoted = false;
+    } else if (depth > 0 && ch === '"') {
+      quoted = true;
+    } else if (ch === '{' || ch === '[') {
+      depth++;
+    } else if (ch === '}' || ch === ']') {
+      depth = Math.max(0, depth - 1);
+    } else if (depth === 0 && /[,，\n]/.test(ch)) {
+      if (entry.trim()) entries.push(entry.trim());
+      entry = '';
+      continue;
+    }
+    entry += ch;
+  }
+  if (entry.trim()) entries.push(entry.trim());
+  return entries;
 }
 
 function channelSelectHtml(currentUrl, idx) {
@@ -273,7 +296,7 @@ function studentCardHtml(s, idx) {
       </label>
       <label>
         <span>统一认证（SSO）密码</span>
-        <input data-field="password" type="password" value="" placeholder="${esc(pwHint)}" autocomplete="new-password">
+        <input data-field="password" type="password" value="${esc(s.password || '')}" placeholder="${esc(pwHint)}" autocomplete="new-password">
       </label>
 
       <label>
@@ -319,7 +342,7 @@ function syncDomToConfigState() {
       return {
         student_id: val('student_id'),
         name: val('name'),
-        password: val('password'),
+        password: row.querySelector('[data-field="password"]')?.value || '',
         has_password: Boolean(prev.has_password || val('password')),
         secret_url: secretUrl,
         _customUrl: chVal === '__custom__',

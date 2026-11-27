@@ -80,7 +80,7 @@ Rust 常驻进程会随每轮轮询检查 `config.json`（即最迟 `poll_interv
 cp config.example.json config.json
 bash deploy/manage.sh build              # 放入官方 Linux 客户端后构建 8081 基础镜像
 bash deploy/manage.sh up                 # 启动 duaa 与已有 8081 账号容器
-bash deploy/manage.sh dashboard on       # 临时开启运维看板（默认 20 分钟后自动关闭）
+bash deploy/manage.sh dashboard on       # 临时开启运维看板（127.0.0.1:9080，默认 20 分钟后关闭）
 bash deploy/manage.sh dashboard off      # 手动关闭运维看板
 ```
 

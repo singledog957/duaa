@@ -50,17 +50,6 @@ async fn execute_task(
     course_id: &str,
     group: &[String],
 ) {
-    // Re-check the student is still configured; hot-reload may have removed them.
-    let Some(filter) = state.cache.get(student_id) else {
-        info!(
-            student = student_id,
-            sched = schedule_id,
-            "task skipped: student no longer in config"
-        );
-        return;
-    };
-
-    // 2. Dynamic validation: fetch today's schedule and confirm sched is unsigned.
     let today = today_str();
     let schedules = match state.client.refresh_schedule(student_id, &today).await {
         Ok(s) => s,
@@ -69,49 +58,41 @@ async fn execute_task(
             return;
         }
     };
-
-    let target = schedules.iter().find(|s| s.id == schedule_id);
-    match target {
-        None => {
-            info!(
-                student = student_id,
-                sched = schedule_id,
-                course_id = course_id,
-                "task skipped: not_found in today's schedule"
-            );
+    let queued_group = if group.is_empty() {
+        vec![schedule_id.to_owned()]
+    } else {
+        group.to_vec()
+    };
+    let group = match current_group(state, student_id, &queued_group, &schedules) {
+        Ok(group) => group,
+        Err(e) => {
+            info!(student = student_id, sched = schedule_id, reason = %e, "task skipped");
             return;
         }
-        Some(s) if s.status() == 1 => {
-            info!(
-                student = student_id,
-                sched = schedule_id,
-                course_id = course_id,
-                "task skipped: already_signed"
-            );
-            return;
-        }
-        // Hot-reload may have excluded this course after the task was enqueued.
-        Some(s) if !filter.matches_in_schedules(s, &schedules) => {
-            info!(
-                student = student_id,
-                sched = schedule_id,
-                course = %s.name,
-                "task skipped: filtered out by current config"
-            );
-            return;
-        }
-        _ => {}
+    };
+    if schedules
+        .iter()
+        .any(|s| group.contains(&s.id) && s.status() == 1)
+    {
+        info!(
+            student = student_id,
+            sched = schedule_id,
+            "task skipped: already_signed"
+        );
+        return;
     }
 
     // 3. Keep the signed 8081 path alive from the pre-class window through
     //    10 minutes after class; only then use the 8082 fallback.
-    let end_unix = schedules
-        .iter()
-        .filter(|s| group.contains(&s.id) || s.id == schedule_id)
-        .filter_map(|s| s.end_time.as_deref().and_then(parse_class_time))
-        .max();
-
-    match run_checkin_with_retries(state, student_id, schedule_id, course_id, group, end_unix).await
+    match run_checkin_with_retries(
+        state,
+        student_id,
+        schedule_id,
+        course_id,
+        &group,
+        &schedules,
+    )
+    .await
     {
         Ok(attempts) => {
             info!(
@@ -145,16 +126,25 @@ async fn run_checkin_with_retries(
     schedule_id: &str,
     course_id: &str,
     group: &[String],
-    end_unix: Option<u64>,
+    schedules: &[crate::client::Schedule],
 ) -> crate::error::AppResult<u32> {
+    let end_unix = schedules
+        .iter()
+        .filter(|s| group.contains(&s.id))
+        .filter_map(|s| s.end_time.as_deref().and_then(parse_class_time))
+        .max();
     let hard_end = end_unix.map(|e| e + POST_CLASS_WINDOW_SECS);
     let mut attempt: u32 = 1;
     if state.client.has_secret_provider(student_id) {
         loop {
-            match do_signed_checkin(state, student_id, schedule_id, group).await {
+            let active = current_group(state, student_id, group, schedules)?;
+            if !state.client.has_secret_provider(student_id) {
+                break;
+            }
+            match do_signed_checkin(state, student_id, &active).await {
                 Ok(()) => return Ok(attempt),
                 Err(e) => {
-                    if group_signed(state, student_id, group).await {
+                    if group_signed(state, student_id, &active).await {
                         info!(
                             student = student_id,
                             sched = schedule_id,
@@ -195,7 +185,8 @@ async fn run_checkin_with_retries(
         );
     }
 
-    match do_fallback_checkin(state, student_id, schedule_id, group).await {
+    let active = current_group(state, student_id, group, schedules)?;
+    match do_fallback_checkin(state, student_id, &active).await {
         Ok(()) => Ok(attempt),
         Err(e) => {
             let jitter: u64 = rand::rng().random_range(1..=5);
@@ -208,7 +199,8 @@ async fn run_checkin_with_retries(
                 "8082 fallback failed; retrying once"
             );
             tokio::time::sleep(Duration::from_secs(jitter)).await;
-            if group_signed(state, student_id, group).await {
+            let active = current_group(state, student_id, group, schedules)?;
+            if group_signed(state, student_id, &active).await {
                 info!(
                     student = student_id,
                     sched = schedule_id,
@@ -216,43 +208,56 @@ async fn run_checkin_with_retries(
                 );
                 return Ok(attempt);
             }
-            do_fallback_checkin(state, student_id, schedule_id, group).await?;
+            do_fallback_checkin(state, student_id, &active).await?;
             Ok(attempt + 1)
         }
     }
 }
 
+/// Re-evaluate every queued member, including before retries and fallback.
+/// Removing the old representative must not discard other selected members.
+fn current_group(
+    state: &AppState,
+    student_id: &str,
+    group: &[String],
+    schedules: &[crate::client::Schedule],
+) -> crate::error::AppResult<Vec<String>> {
+    let filter = state.cache.get(student_id).ok_or_else(|| {
+        crate::error::AppError::new("task_cancelled", "student no longer configured")
+    })?;
+    let active: Vec<String> = group
+        .iter()
+        .filter(|id| {
+            schedules
+                .iter()
+                .any(|s| s.id == **id && filter.matches_in_schedules(s, schedules))
+        })
+        .cloned()
+        .collect();
+    if active.is_empty() {
+        return Err(crate::error::AppError::new(
+            "task_cancelled",
+            "no selected group members remain in today's schedule",
+        ));
+    }
+    Ok(active)
+}
+
 async fn do_signed_checkin(
     state: &AppState,
     student_id: &str,
-    course_sched_id: &str,
     group: &[String],
 ) -> crate::error::AppResult<()> {
-    if group.is_empty() {
-        state
-            .client
-            .checkin_signed(student_id, &[course_sched_id.to_owned()])
-            .await?;
-    } else {
-        state.client.checkin_signed(student_id, group).await?;
-    }
+    state.client.checkin_signed(student_id, group).await?;
     Ok(())
 }
 
 async fn do_fallback_checkin(
     state: &AppState,
     student_id: &str,
-    course_sched_id: &str,
     group: &[String],
 ) -> crate::error::AppResult<()> {
-    if group.is_empty() {
-        state
-            .client
-            .checkin_fallback(student_id, &[course_sched_id.to_owned()])
-            .await?;
-    } else {
-        state.client.checkin_fallback(student_id, group).await?;
-    }
+    state.client.checkin_fallback(student_id, group).await?;
     Ok(())
 }
 
@@ -275,4 +280,108 @@ fn today_str() -> String {
     use time::OffsetDateTime;
     let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
     format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::scheduler::CourseFilter;
+
+    fn state() -> AppState {
+        AppState {
+            cfg: Arc::new(crate::config::Config {
+                poll_interval_minutes: 5,
+                auto_window_minutes: 15,
+                log_file: None,
+                students: vec![],
+            }),
+            config_path: String::new(),
+            client: Arc::new(crate::client::ClassClient::new(&[])),
+            cache: Arc::new(crate::pipeline::SchedulerCache::new()),
+            queue: Arc::new(crate::pipeline::TaskQueue::new()),
+        }
+    }
+
+    fn schedules() -> Vec<crate::client::Schedule> {
+        [("1", "11", "A"), ("2", "22", "B")]
+            .into_iter()
+            .map(|(id, course, name)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "courseId": course, "courseName": name,
+                    "teacherName": "T", "classBeginTime": "2100-01-01 08:00:00"
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queued_group_uses_reloaded_exclusions_for_every_member() {
+        let state = state();
+        let group = vec!["1".into(), "2".into()];
+        let schedules = schedules();
+        state
+            .cache
+            .set("s1".into(), CourseFilter::new(&["*".into()], &[]));
+        assert_eq!(
+            current_group(&state, "s1", &group, &schedules).unwrap(),
+            group
+        );
+        // Excluding the non-representative after enqueue must remove it too.
+        state
+            .cache
+            .set("s1".into(), CourseFilter::new(&["*".into()], &["B".into()]));
+        assert_eq!(
+            current_group(&state, "s1", &group, &schedules).unwrap(),
+            vec!["1"]
+        );
+        // Excluding the representative must still allow the other course.
+        state.cache.set(
+            "s1".into(),
+            CourseFilter::new(&["*".into()], &["11".into()]),
+        );
+        assert_eq!(
+            current_group(&state, "s1", &group, &schedules).unwrap(),
+            vec!["2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_groups_never_reach_fallback() {
+        let state = state();
+        let group = vec!["1".into(), "2".into()];
+        let schedules = schedules();
+        state.cache.set(
+            "s1".into(),
+            CourseFilter::new(&["*".into()], &["A".into(), "B".into()]),
+        );
+        let error = run_checkin_with_retries(&state, "s1", "1", "11", &group, &schedules)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "task_cancelled");
+        state.cache.remove("s1");
+        let error = run_checkin_with_retries(&state, "s1", "1", "11", &group, &schedules)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "task_cancelled");
+    }
+
+    #[test]
+    fn vanished_group_member_is_not_sent_to_checkin() {
+        let state = state();
+        state
+            .cache
+            .set("s1".into(), CourseFilter::new(&["*".into()], &[]));
+        let group = vec!["missing".into(), "2".into()];
+        assert_eq!(
+            current_group(&state, "s1", &group, &schedules()).unwrap(),
+            vec!["2"]
+        );
+        assert_eq!(
+            current_group(&state, "s1", &["missing".into()], &schedules())
+                .unwrap_err()
+                .code,
+            "task_cancelled"
+        );
+    }
 }
