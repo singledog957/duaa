@@ -11,8 +11,8 @@ SSO_LOGIN_URL="https://sso.buaa.edu.cn/login"
 JUMP_URL="https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter"
 LOGIN_BUAA_URL="https://iclass.buaa.edu.cn:8346/eschool/app/user/login_buaa.do"
 SCHEDULE_URL="https://iclass.buaa.edu.cn:8347/app/course/get_stu_course_sched.action"
-CHECKIN_URL="http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action"
-TIMESTAMP_URL="http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action"
+CHECKIN_URL="http://iclass.buaa.edu.cn:8082/eschool/app/course/stu_scan_sign.action"
+TIMESTAMP_URL="http://iclass.buaa.edu.cn:8082/app/common/get_timestamp.action"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 log() {
@@ -381,14 +381,15 @@ phase_checkin() {
   [[ "$target_status" != "1" ]] || { log "[$STUDENT_ID][$course_name] skip: already signed"; exit 0; }
   [[ "$target_status" != "ERROR" ]] || { log "[$STUDENT_ID][$course_name] error parsing schedule cache"; exit 1; }
 
-  local sign_resp sign_status sign_msg
+  local sign_resp sign_status student_sign_status sign_msg
   sign_resp="$(checkin "$class_id" "$login_name" "$SCHEDULE_ID")"
   sign_status="$(printf '%s' "$sign_resp" | jq -r '.STATUS // ""')"
+  student_sign_status="$(jq -r '.result.stuSignStatus? // empty' <<<"$sign_resp")"
   sign_msg="$(printf '%s' "$sign_resp" | jq -r '.ERRMSG // ""')"
-  if [[ "$sign_status" == "0" ]]; then
+  if [[ "$sign_status" == "0" && "$student_sign_status" == "1" ]]; then
     log "[$STUDENT_ID][$course_name] checkin ok"
   else
-    log "[$STUDENT_ID][$course_name] checkin failed: status=$sign_status msg=$sign_msg"
+    log "[$STUDENT_ID][$course_name] checkin failed: status=$sign_status stuSignStatus=${student_sign_status:-missing} msg=$sign_msg"
     exit 1
   fi
 }
