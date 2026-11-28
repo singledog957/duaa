@@ -10,28 +10,89 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 pub struct AppState {
     pub cfg: Arc<config::Config>,
+    pub config_path: String,
     pub client: Arc<client::ClassClient>,
     pub cache: Arc<pipeline::SchedulerCache>,
     pub queue: Arc<pipeline::TaskQueue>,
 }
 
-fn parse_config_path() -> String {
+fn parse_args() -> (String, bool) {
+    let mut config_path = "config.json".to_string();
+    let mut status_mode = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--config" {
-            if let Some(path) = args.next() {
-                return path;
+        match arg.as_str() {
+            "--config" => {
+                if let Some(path) = args.next() {
+                    config_path = path;
+                } else {
+                    eprintln!("missing value for --config");
+                    std::process::exit(1);
+                }
             }
-            eprintln!("missing value for --config");
-            std::process::exit(1);
+            "--status" => status_mode = true,
+            _ => {}
         }
     }
-    "config.json".to_string()
+    (config_path, status_mode)
 }
 
-fn init_logging(log_file: Option<&str>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let env = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "duaa=info".into());
+/// One-shot mode: print today's real sign status for every configured student.
+async fn run_status(state: Arc<AppState>) {
+    let today = {
+        use time::macros::offset;
+        use time::OffsetDateTime;
+        let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
+        format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day())
+    };
+
+    for student in &state.cfg.students {
+        match state
+            .client
+            .query_schedule_force(&student.student_id, &today)
+            .await
+        {
+            Ok(schedules) if schedules.is_empty() => {
+                println!("[{} {}] 今日无课", student.student_id, student.name);
+            }
+            Ok(schedules) => {
+                for s in &schedules {
+                    let mark = if s.status() == 1 {
+                        "✅ 已签"
+                    } else {
+                        "⬜ 未签"
+                    };
+                    println!(
+                        "[{} {}] {} {} {} (courseId={} code={} schedId={})",
+                        student.student_id,
+                        student.name,
+                        mark,
+                        s.time,
+                        s.name,
+                        s.course_id,
+                        s.course_num,
+                        s.id
+                    );
+                }
+            }
+            Err(e) => {
+                println!("[{} {}] 查询失败: {e}", student.student_id, student.name);
+            }
+        }
+    }
+}
+
+fn init_logging(
+    log_file: Option<&str>,
+    quiet: bool,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let env = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if quiet {
+            "duaa=warn".into()
+        } else {
+            "duaa=info".into()
+        }
+    });
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
@@ -69,9 +130,9 @@ fn init_logging(log_file: Option<&str>) -> Option<tracing_appender::non_blocking
 
 #[tokio::main]
 async fn main() {
-    let config_path = parse_config_path();
+    let (config_path, status_mode) = parse_args();
     let cfg = Arc::new(config::Config::load(&config_path));
-    let _log_guard = init_logging(cfg.log_file.as_deref());
+    let _log_guard = init_logging(cfg.log_file.as_deref(), status_mode);
 
     info!(
         config = %config_path,
@@ -86,16 +147,25 @@ async fn main() {
     let queue = Arc::new(pipeline::TaskQueue::new());
 
     for student in &cfg.students {
-        cache.set(student.student_id.clone(), student.course_ids.clone());
+        cache.set(
+            student.student_id.clone(),
+            pipeline::scheduler::CourseFilter::from(student),
+        );
         info!(student = %student.student_id, name = %student.name, "loaded student config");
     }
 
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
+        config_path: config_path.clone(),
         client,
         cache,
         queue,
     });
+
+    if status_mode {
+        run_status(state).await;
+        return;
+    }
 
     let poller_state = state.clone();
     tokio::spawn(async move {

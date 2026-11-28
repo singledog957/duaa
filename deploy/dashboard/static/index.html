@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>duaa 运维控制台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">D</div>
+        <div>
+          <div class="brand-title">duaa</div>
+          <div class="brand-sub">BUAA 自动签到控制台</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="overview" type="button">
+          <span class="nav-dot"></span><span>总览</span>
+        </button>
+        <button class="nav-item" data-view="accounts" type="button">
+          <span class="nav-dot"></span><span>8081 账号容器</span>
+          <span id="nav-badge-accounts" class="nav-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="config" type="button">
+          <span class="nav-dot"></span><span>签到配置</span>
+          <span id="nav-badge-students" class="nav-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="infra" type="button">
+          <span class="nav-dot"></span><span>监控与容器</span>
+        </button>
+        <button class="nav-item" data-view="logs" type="button">
+          <span class="nav-dot"></span><span>签到日志</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-row">
+          <span id="global-status" class="pill neutral">正在连接</span>
+        </div>
+        <div id="ttl-box" class="ttl-box hidden">
+          <div class="muted small">看板自动关闭倒计时</div>
+          <div id="ttl-countdown" class="ttl-time">--:--</div>
+          <div class="btn-group">
+            <button id="ttl-extend" class="btn ghost sm" type="button">续期 +10m</button>
+            <button id="ttl-shutdown" class="btn danger sm" type="button">立即关闭</button>
+          </div>
+        </div>
+        <div id="updated-at" class="muted small">尚未刷新</div>
+        <button id="refresh-all" class="btn ghost full" type="button">立即刷新数据</button>
+      </div>
+    </aside>
+
+    <div class="content-wrap">
+      <header class="page-header">
+        <div>
+          <h1 id="page-title">系统总览</h1>
+          <p id="page-subtitle" class="muted">自动签到服务、8081 账号容器与宿主机运行状态</p>
+        </div>
+        <div class="header-actions" id="header-actions"></div>
+      </header>
+
+      <main class="views">
+        <!-- 1. 总览 -->
+        <section id="view-overview" class="view active">
+          <div class="kpi-grid">
+            <article class="kpi-card">
+              <div class="kpi-label">签到引擎（duaa）</div>
+              <div class="kpi-value" id="kpi-duaa">--</div>
+              <div class="kpi-sub" id="kpi-duaa-sub">等待采样</div>
+            </article>
+            <article class="kpi-card">
+              <div class="kpi-label">8081 账号容器</div>
+              <div class="kpi-value" id="kpi-accounts">--</div>
+              <div class="kpi-sub" id="kpi-accounts-sub">等待采样</div>
+            </article>
+            <article class="kpi-card">
+              <div class="kpi-label">已配置学生</div>
+              <div class="kpi-value" id="kpi-students">--</div>
+              <div class="kpi-sub" id="kpi-students-sub">等待读取配置</div>
+            </article>
+            <article class="kpi-card">
+              <div class="kpi-label">宿主机状态</div>
+              <div class="kpi-value" id="kpi-host">--</div>
+              <div class="kpi-sub" id="kpi-host-sub">等待采样</div>
+            </article>
+          </div>
+
+          <div class="two-col">
+            <article class="panel">
+              <div class="panel-head">
+                <h2>快速操作</h2>
+              </div>
+              <div class="quick-grid">
+                <button class="quick-card" data-jump="accounts" type="button">
+                  <strong>管理 8081 账号容器</strong>
+                  <span>新增/删除容器、扫码登录、测试 /secret</span>
+                </button>
+                <button class="quick-card" data-jump="config" type="button">
+                  <strong>配置 8081 / 8082 签到</strong>
+                  <span>切换签到模式、绑定容器、热加载课程</span>
+                </button>
+                <button class="quick-card" data-jump="logs" type="button">
+                  <strong>查看实时签到日志</strong>
+                  <span>筛选签到成功、重试与告警记录</span>
+                </button>
+                <button class="quick-card" id="quick-restart-duaa" type="button">
+                  <strong>重启 duaa 服务</strong>
+                  <span>修改全局轮询/窗口参数后一键生效</span>
+                </button>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <h2>最近签到动态</h2>
+                <button class="btn ghost sm" data-jump="logs" type="button">查看全部</button>
+              </div>
+              <pre id="overview-logs" class="log-preview">正在读取日志…</pre>
+            </article>
+          </div>
+        </section>
+
+        <!-- 2. 8081 账号容器 -->
+        <section id="view-accounts" class="view">
+          <article class="panel create-bar">
+            <div class="create-bar-info">
+              <h2>新增 8081 账号容器</h2>
+              <p class="muted small">每个需要走 8081 官方签名签到的学生对应一个独立容器（仅绑定 127.0.0.1，固定 hostname 保持登录态）。</p>
+            </div>
+            <form id="create-account-form" class="create-form">
+              <label>
+                <span>实例名</span>
+                <input id="new-acc-name" type="text" placeholder="例如 stu2" pattern="[a-z0-9][a-z0-9_-]{0,23}" required autocomplete="off">
+              </label>
+              <label>
+                <span>本机端口（可选）</span>
+                <input id="new-acc-port" type="number" min="1024" max="65535" placeholder="留空自动分配">
+              </label>
+              <button id="create-acc-btn" class="btn primary" type="submit">创建并启动</button>
+            </form>
+          </article>
+
+          <div id="accounts-grid" class="account-grid">
+            <div class="empty-state">正在读取账号容器…</div>
+          </div>
+        </section>
+
+        <!-- 3. 签到配置 -->
+        <section id="view-config" class="view">
+          <div id="config-error" class="alert error hidden"></div>
+
+          <div class="students-toolbar">
+            <div class="toolbar-left">
+              <h2>学生列表</h2>
+              <span id="config-meta" class="muted small">--</span>
+            </div>
+            <div class="toolbar-right">
+              <button id="add-student" class="btn ghost" type="button">+ 新增学生</button>
+              <button id="reset-config" class="btn ghost" type="button">还原</button>
+              <button id="save-config" class="btn primary" type="button">保存配置</button>
+            </div>
+          </div>
+
+          <div id="config-students" class="student-list"></div>
+
+          <details class="panel global-details">
+            <summary class="global-summary">
+              <span>全局运行参数（轮询间隔 / 课前窗口 / 日志文件）</span>
+              <span class="muted small">修改后需重启 duaa</span>
+            </summary>
+            <div class="global-body">
+              <div class="global-grid">
+                <label>
+                  <span>轮询间隔（分钟）</span>
+                  <input id="config-poll-interval" type="number" min="1" max="1440" step="1">
+                </label>
+                <label>
+                  <span>课前自动窗口（分钟）</span>
+                  <input id="config-auto-window" type="number" min="1" max="1440" step="1">
+                </label>
+                <label>
+                  <span>日志文件（限定 logs/ 目录）</span>
+                  <input id="config-log-file" type="text" placeholder="logs/duaa.log">
+                </label>
+              </div>
+              <div class="global-actions">
+                <span class="muted small">学生配置保存后自动热加载；仅修改上述全局参数时需要重启。</span>
+                <button id="restart-duaa-btn" class="btn ghost sm" type="button">重启 duaa</button>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <!-- 4. 监控与容器 -->
+        <section id="view-infra" class="view">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>宿主机实时监控</h2>
+                <p id="host-caption" class="muted small">CPU、内存、磁盘与网络状态</p>
+              </div>
+            </div>
+            <div id="host-metrics" class="metric-grid"><div class="empty-state">正在采集宿主机指标…</div></div>
+            <div id="host-details" class="detail-grid"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Docker Compose 容器</h2>
+                <p id="compose-caption" class="muted small">项目关联容器运行状态</p>
+              </div>
+            </div>
+            <div id="compose-error" class="alert error hidden"></div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>项目 / 服务</th>
+                    <th>容器名称</th>
+                    <th>状态</th>
+                    <th>镜像</th>
+                    <th>端口映射</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="compose-containers">
+                  <tr><td colspan="6" class="empty-cell">正在读取容器…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <!-- 5. 签到日志 -->
+        <section id="view-logs" class="view">
+          <article class="panel log-panel">
+            <div class="log-controls">
+              <div class="level-tabs" role="tablist">
+                <button class="chip active" data-log-level="all" type="button">全部</button>
+                <button class="chip" data-log-level="success" type="button">成功</button>
+                <button class="chip" data-log-level="warn" type="button">警告</button>
+                <button class="chip" data-log-level="error" type="button">错误</button>
+              </div>
+              <div class="log-right">
+                <input id="log-filter" type="search" placeholder="搜索学号 / 课程 / 关键词…">
+                <select id="log-lines">
+                  <option value="100">100 行</option>
+                  <option value="200" selected>200 行</option>
+                  <option value="500">500 行</option>
+                </select>
+                <label class="inline-check"><input id="log-follow" type="checkbox" checked> 自动滚动</label>
+                <button id="refresh-logs" class="btn ghost sm" type="button">刷新</button>
+              </div>
+            </div>
+            <div id="log-error" class="alert error hidden"></div>
+            <pre id="logs" class="log-terminal" tabindex="0">正在读取日志…</pre>
+            <div class="log-footer">
+              <span id="log-path" class="muted small">--</span>
+              <span id="log-stats" class="muted small">--</span>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- 放大登录画面弹窗 -->
+  <div id="zoom" class="modal hidden" role="dialog" aria-modal="true" aria-label="放大登录画面">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <strong id="zoom-title">账号登录</strong>
+        <button id="zoom-close" class="btn ghost sm" type="button">关闭 Esc</button>
+      </div>
+      <img id="zoom-image" alt="账号登录画面">
+      <div class="modal-foot">
+        <span id="zoom-time" class="muted small"></span>
+        <div class="btn-group">
+          <button id="zoom-qr" class="btn ghost sm" type="button">弹出二维码</button>
+          <button id="zoom-login" class="btn ghost sm" type="button">点 Login</button>
+          <button id="zoom-refresh" class="btn primary sm" type="button">刷新画面</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 删除账号容器确认弹窗 -->
+  <div id="delete-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="删除账号容器">
+    <div class="modal-panel modal-sm">
+      <div class="modal-head">
+        <strong id="delete-title">删除账号容器</strong>
+        <button id="delete-cancel-x" class="btn ghost sm" type="button">关闭</button>
+      </div>
+      <div class="modal-body">
+        <p id="delete-desc" class="muted">将停止并删除该账号的 Docker 容器与实例目录。</p>
+        <label class="inline-check danger-check">
+          <input id="delete-remove-volume" type="checkbox">
+          <span>同时删除持久化登录态数据卷（下次重建需重新扫码）</span>
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button id="delete-cancel" class="btn ghost" type="button">取消</button>
+        <button id="delete-confirm" class="btn danger" type="button">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

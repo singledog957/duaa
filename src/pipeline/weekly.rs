@@ -31,8 +31,8 @@ fn date_string(date: Date) -> String {
     )
 }
 
-/// Refresh each day of the current week once. Sunday evening also plans next week.
-/// Failed days are retried on the next tick; a restart rebuilds the in-memory plan.
+/// Refresh each day of the current week once for students with `auto_include_new_courses`.
+/// Sunday evening also plans next week. Failed days are retried on the next tick.
 pub async fn run(state: Arc<AppState>) {
     let mut planned = HashSet::<(String, String)>::new();
     let mut failed_at = HashMap::<(String, String), Instant>::new();
@@ -41,15 +41,15 @@ pub async fn run(state: Arc<AppState>) {
         ticker.tick().await;
         let now = OffsetDateTime::now_utc().to_offset(offset!(+8));
         let dates = dates_to_plan(now);
-        for student in state
-            .cfg
-            .students
-            .iter()
-            .filter(|s| s.auto_include_new_courses)
+        for (student_id, filter) in state
+            .cache
+            .snapshot()
+            .into_iter()
+            .filter(|(_, f)| f.auto_include_new_courses())
         {
             for date in &dates {
                 let day = date_string(*date);
-                let key = (student.student_id.clone(), day.clone());
+                let key = (student_id.clone(), day.clone());
                 if planned.contains(&key) {
                     continue;
                 }
@@ -59,28 +59,16 @@ pub async fn run(state: Arc<AppState>) {
                 {
                     continue;
                 }
-                match state
-                    .client
-                    .refresh_schedule(&student.student_id, &day)
-                    .await
-                {
+                match state.client.refresh_schedule(&student_id, &day).await {
                     Ok(schedules) => {
-                        scheduler::plan_tasks(
-                            &state.queue,
-                            &student.student_id,
-                            &schedules,
-                            &[],
-                            0,
-                            true,
-                        )
-                        .await;
+                        scheduler::plan_tasks(&state.queue, &student_id, &schedules, &filter).await;
                         failed_at.remove(&key);
                         planned.insert(key);
-                        info!(student = %student.student_id, date = %day, "weekly day planned");
+                        info!(student = %student_id, date = %day, "weekly day planned");
                     }
                     Err(err) => {
                         failed_at.insert(key, Instant::now());
-                        warn!(student = %student.student_id, date = %day, err = %err, "weekly day failed; retry later");
+                        warn!(student = %student_id, date = %day, err = %err, "weekly day failed; retry later");
                     }
                 }
             }
