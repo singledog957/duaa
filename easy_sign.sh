@@ -381,14 +381,15 @@ phase_checkin() {
   [[ "$target_status" != "1" ]] || { log "[$STUDENT_ID][$course_name] skip: already signed"; exit 0; }
   [[ "$target_status" != "ERROR" ]] || { log "[$STUDENT_ID][$course_name] error parsing schedule cache"; exit 1; }
 
-  local sign_resp sign_status sign_msg
+  local sign_resp sign_status student_sign_status sign_msg
   sign_resp="$(checkin "$class_id" "$login_name" "$SCHEDULE_ID")"
   sign_status="$(printf '%s' "$sign_resp" | jq -r '.STATUS // ""')"
+  student_sign_status="$(jq -r '.result.stuSignStatus? // empty' <<<"$sign_resp")"
   sign_msg="$(printf '%s' "$sign_resp" | jq -r '.ERRMSG // ""')"
-  if [[ "$sign_status" == "0" ]]; then
+  if [[ "$sign_status" == "0" && "$student_sign_status" == "1" ]]; then
     log "[$STUDENT_ID][$course_name] checkin ok"
   else
-    log "[$STUDENT_ID][$course_name] checkin failed: status=$sign_status msg=$sign_msg"
+    log "[$STUDENT_ID][$course_name] checkin failed: status=$sign_status stuSignStatus=${student_sign_status:-missing} msg=$sign_msg"
     exit 1
   fi
 }
